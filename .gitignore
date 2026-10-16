@@ -1,0 +1,11 @@
+/target
+Cargo.lock
+.env
+*.log
+dist/
+pkg/
+node_modules/
+.trunk/
+site/
+target/
+uploads/

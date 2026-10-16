@@ -1,0 +1,21 @@
+[package]
+name = "module-21-i18n"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Leptos with CSR enabled renders this module directly in the browser.
+leptos = { workspace = true, features = ["csr"] }
+# Better panic messages in the browser console during course demos.
+console_error_panic_hook = { workspace = true }
+# Browser DOM types used by event handlers and direct API examples.
+web-sys = { workspace = true }
+# Timers are used by debounce, animation, and async client examples.
+gloo-timers = { workspace = true }
+# Browser storage is used by persistence-oriented modules.
+gloo-storage = { workspace = true }
+# HTTP fetch helpers are used by async resource modules.
+gloo-net = { workspace = true }
+# Serialization support for client-side examples.
+serde = { workspace = true }
+serde_json = { workspace = true }

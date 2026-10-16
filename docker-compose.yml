@@ -1,0 +1,26 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: leptos_course
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  app:
+    build: .
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/leptos_course
+      JWT_SECRET: change-this-secret-in-production
+      LEPTOS_SITE_ADDR: 0.0.0.0:3000
+      RUST_LOG: info
+    ports:
+      - "3000:3000"
+
+volumes:
+  postgres-data:
