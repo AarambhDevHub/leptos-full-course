@@ -14,6 +14,7 @@ use leptos_meta::{provide_meta_context, Meta, MetaTags, Title};
 use leptos_router::components::{Route, Router, Routes, A};
 use leptos_router::hooks::use_params_map;
 use leptos_router::path;
+use leptos_router::SsrMode;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "ssr")]
@@ -80,13 +81,17 @@ pub fn App() -> impl IntoView {
     provide_meta_context();
 
     view! {
+        // Default title only. Each page sets its own description: `Meta` tags are not
+        // de-duplicated, so a second description here would end up in the head twice.
         <Title text=MODULE_TITLE/>
-        <Meta name="description" content="SSR and hydration in the Leptos 0.8 full course"/>
         <Router>
             <main style="max-width: 860px; margin: 0 auto; padding: 32px; font-family: system-ui, sans-serif;">
                 <Routes fallback=|| view! { <NotFoundPage/> }>
                     <Route path=path!("/") view=BlogList/>
-                    <Route path=path!("/blog/:slug") view=ArticlePage/>
+                    // Async SSR waits for the article before sending HTML, so the article's own title and
+                    // description are in the <head> and the body is complete in the first response.
+                    // (With default streaming, tags set inside a Suspense arrive too late for the head.)
+                    <Route path=path!("/blog/:slug") view=ArticlePage ssr=SsrMode::Async/>
                 </Routes>
             </main>
         </Router>

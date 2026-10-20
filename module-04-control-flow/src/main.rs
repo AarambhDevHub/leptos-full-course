@@ -101,15 +101,18 @@ fn TodoList() -> impl IntoView {
         },
     ]);
 
+    // Keys must be unique and stable, so ids come from a counter that only ever goes up.
+    // (Using `items.len() + 1` would reuse an id after a delete, and `<For/>` would skip the new row.)
+    let next_id = RwSignal::new(3_u64);
+
     let add_todo = move || {
         let title = draft.read().trim().to_string();
         if title.is_empty() {
             return;
         }
-        todos.update(|items| {
-            let id = items.len() as u64 + 1;
-            items.push(Todo { id, title });
-        });
+        let id = next_id.get();
+        next_id.set(id + 1);
+        todos.update(|items| items.push(Todo { id, title }));
         draft.set(String::new());
     };
 

@@ -139,22 +139,18 @@ fn jwt_secret() -> String {
 /// Why it matters: Passwords should never be stored directly, even in a course example.
 #[cfg(feature = "ssr")]
 fn hash_password(password: &str) -> Result<String, ServerFnError> {
-    use argon2::password_hash::{PasswordHasher, SaltString};
+    use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
     use argon2::Argon2;
 
-    // A fixed salt keeps this course example deterministic. Production code
-    // should generate and store a fresh salt for every password.
-    let salt = SaltString::from_b64("bGVwdG9zX2NvdXJzZV9zYWx0").map_err(ServerFnError::new)?;
+    // A fresh random salt for every password: two users with the same password get different hashes,
+    // and one precomputed table cannot attack all of them at once. The salt is stored inside the hash string.
+    let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
         .map(|hash| hash.to_string())
         .map_err(ServerFnError::new)
 }
 
-/// Explains the `verify password` step in this lesson.
-///
-/// What it does: checks a login password against the stored Argon2 hash.
-/// Why it matters: Authentication is only useful if the server can prove the submitted password matches the hash.
 #[cfg(feature = "ssr")]
 fn verify_password(password: &str, password_hash: &str) -> Result<bool, ServerFnError> {
     use argon2::password_hash::{PasswordHash, PasswordVerifier};
@@ -217,6 +213,7 @@ fn set_cookie(token: &str) -> Result<(), ServerFnError> {
 
     let response = use_context::<leptos_axum::ResponseOptions>()
         .ok_or_else(|| ServerFnError::new("ResponseOptions missing"))?;
+    // HttpOnly keeps scripts from reading the token. Add `Secure` as well when the site is served over HTTPS.
     let cookie = format!("auth_session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400");
     response.append_header(
         header::SET_COOKIE,
@@ -298,7 +295,16 @@ pub async fn register(name: String, email: String, password: String) -> Result<(
         .bind(password_hash)
         .execute(&pool()?)
         .await
-        .map_err(ServerFnError::new)?;
+        .map_err(|err| match &err {
+            // Tell the user what they can fix, and keep database details (table and constraint names) on the server.
+            sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
+                ServerFnError::new("that email is already registered")
+            }
+            _ => {
+                tracing::error!("register failed: {err}");
+                ServerFnError::new("could not create the account, please try again")
+            }
+        })?;
     }
     Ok(())
 }
