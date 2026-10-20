@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "ssr")]
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Mutex,
 };
 
@@ -27,6 +27,9 @@ use std::sync::{
 static TODOS: Mutex<Vec<TodoItem>> = Mutex::new(Vec::new());
 #[cfg(feature = "ssr")]
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+// The sample todos are added only once, so deleting them all really leaves an empty list.
+#[cfg(feature = "ssr")]
+static SEEDED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct TodoItem {
@@ -120,7 +123,7 @@ pub async fn list_todos() -> Result<Vec<TodoItem>, ServerFnError> {
         let mut todos = TODOS
             .lock()
             .map_err(|_| ServerFnError::new("todo store lock poisoned"))?;
-        if todos.is_empty() {
+        if !SEEDED.swap(true, Ordering::SeqCst) && todos.is_empty() {
             todos.push(TodoItem {
                 id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
                 title: "Learn #[server]".into(),

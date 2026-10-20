@@ -154,6 +154,10 @@ pub async fn create_note(title: String, body: String) -> Result<Note, ServerFnEr
 #[server]
 pub async fn update_note(id: String, title: String, body: String) -> Result<Note, ServerFnError> {
     let id = Uuid::parse_str(&id).map_err(ServerFnError::new)?;
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return Err(ServerFnError::new("title is required"));
+    }
 
     #[cfg(feature = "ssr")]
     {
@@ -306,7 +310,12 @@ fn NoteCard(
                             <button on:click=move |_| {
                                 leptos::task::spawn_local(async move {
                                     match update_note(id.to_string(), title.get(), body.get()).await {
-                                        Ok(_) => {
+                                        Ok(saved) => {
+                                            local_notes.update(|items| {
+                                                if let Some(item) = items.iter_mut().find(|item| item.id == id) {
+                                                    *item = saved;
+                                                }
+                                            });
                                             editing_id.set(None);
                                             on_changed.run(());
                                         }
@@ -320,16 +329,25 @@ fn NoteCard(
                 }.into_any()
             } else {
                 let note_for_delete = note_for_delete.clone();
-                let preview = if note.body.len() > 50 {
-                    format!("{}...", &note.body[..50])
-                } else {
-                    note.body.clone()
-                };
+                let note_for_view = note.clone();
                 view! {
                     <div>
-                        <h2>{note.title.clone()}</h2>
-                        <p>{preview}</p>
-                        <small>{note.created_at.format("%Y-%m-%d %H:%M UTC").to_string()}</small>
+                        // Read the note from the shared list, not from the copy captured when this card was
+                        // built: `<For/>` keeps the same card for an existing key, so a captured copy would
+                        // keep showing the old title after an edit.
+                        {move || {
+                            let item = local_notes
+                                .read()
+                                .iter()
+                                .find(|item| item.id == id)
+                                .cloned()
+                                .unwrap_or_else(|| note_for_view.clone());
+                            view! {
+                                <h2>{item.title.clone()}</h2>
+                                <p>{note_preview(&item.body)}</p>
+                                <small>{item.created_at.format("%Y-%m-%d %H:%M UTC").to_string()}</small>
+                            }
+                        }}
                         <div>
                             <button on:click=move |_| editing_id.set(Some(id))>"Edit"</button>
                             <button on:click=move |_| {
@@ -357,6 +375,43 @@ fn NoteCard(
 ///
 /// What it does: renders the `NotFound` component for one focused part of the lesson UI.
 /// Why it matters: Keeping this UI section isolated makes the signal, context, action, or routing pattern easier to study.
+/// Builds the short preview shown on a note card.
+///
+/// It counts characters, not bytes. Slicing a `String` at a byte index panics when that index falls
+/// inside a multi-byte character (Hindi, Gujarati, emoji), and a panic kills the whole WebAssembly app.
+fn note_preview(body: &str) -> String {
+    const PREVIEW_CHARS: usize = 50;
+    if body.chars().count() > PREVIEW_CHARS {
+        format!("{}...", body.chars().take(PREVIEW_CHARS).collect::<String>())
+    } else {
+        body.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::note_preview;
+
+    #[test]
+    fn short_text_is_unchanged() {
+        assert_eq!(note_preview("hello"), "hello");
+    }
+
+    #[test]
+    fn long_ascii_text_is_cut_at_fifty_characters() {
+        let preview = note_preview(&"a".repeat(80));
+        assert_eq!(preview, format!("{}...", "a".repeat(50)));
+    }
+
+    #[test]
+    fn long_hindi_text_does_not_panic() {
+        let body = "नमस्ते दुनिया यह एक लंबा नोट है जो मराठी और हिंदी में लिखा गया है";
+        let preview = note_preview(body);
+        assert!(preview.ends_with("..."));
+        assert_eq!(preview.chars().count(), 53);
+    }
+}
+
 #[component]
 fn NotFound() -> impl IntoView {
     view! {

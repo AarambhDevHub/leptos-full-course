@@ -181,10 +181,11 @@ fn prod_secret() -> String {
 /// Why it matters: Passwords should never be stored directly, even in a course example.
 #[cfg(feature = "ssr")]
 fn hash_password(password: &str) -> Result<String, ServerFnError> {
-    use argon2::password_hash::{PasswordHasher, SaltString};
+    use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
     use argon2::Argon2;
 
-    let salt = SaltString::from_b64("bW9kdWxlMjVfcHJvZF9zYWx0").map_err(ServerFnError::new)?;
+    // A fresh random salt for every password, stored inside the resulting hash string.
+    let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
         .map(|hash| hash.to_string())
@@ -348,7 +349,15 @@ pub async fn prod_register(
         .bind(hash_password(&password)?)
         .execute(&pool()?)
         .await
-        .map_err(ServerFnError::new)?;
+        .map_err(|err| match &err {
+            sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
+                ServerFnError::new("that email is already registered")
+            }
+            _ => {
+                tracing::error!("register failed: {err}");
+                ServerFnError::new("could not create the account, please try again")
+            }
+        })?;
     }
     Ok(())
 }
