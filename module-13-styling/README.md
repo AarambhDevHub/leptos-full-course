@@ -1,4 +1,4 @@
-# Module 13 - Styling and Tailwind
+# Module 13 - Styling
 
 ## What You'll Learn
 

@@ -66,10 +66,17 @@ struct Notification {
 ///
 /// What it does: packages the `use notify` behavior into a reusable hook-style helper.
 /// Why it matters: Hooks keep repeated reactive wiring out of the components that only need to consume the behavior.
+/// Hands out notification ids. The counter only ever goes up, so an id is never reused.
+/// (Using `items.len() + 1` would reuse an id after a toast expires, and `<For/>` would skip the new toast.)
+#[derive(Clone, Copy)]
+struct NextNotificationId(RwSignal<u32>);
+
 fn use_notify() -> impl Fn(String, Level) + Clone {
     let notifications = use_context::<RwSignal<Vec<Notification>>>().expect("notification context");
+    let next_id = use_context::<NextNotificationId>().expect("notification id counter").0;
     move |message, level| {
-        let id = notifications.read().len() as u32 + 1;
+        let id = next_id.get_untracked();
+        next_id.set(id + 1);
         notifications.update(|items| items.push(Notification { id, message, level }));
         let handle = Timeout::new(3_000, move || {
             notifications.update(|items| items.retain(|item| item.id != id));
@@ -154,8 +161,14 @@ fn CartSummary() -> impl IntoView {
                 <For
                     each=move || cart.get()
                     key=|item| item.id
-                    children=|item| view! {
-                        <li>{item.name} " x" {item.qty}</li>
+                    children=move |item| {
+                        // The row survives when the quantity changes (same key), so read the quantity
+                        // from the cart signal instead of from the copy captured when the row was built.
+                        let id = item.id;
+                        let qty = move || {
+                            cart.read().iter().find(|line| line.id == id).map(|line| line.qty).unwrap_or(0)
+                        };
+                        view! { <li>{item.name} " x" {qty}</li> }
                     }
                 />
             </ul>
@@ -285,6 +298,7 @@ fn App() -> impl IntoView {
     provide_context(theme);
     provide_context(RwSignal::new(Vec::<CartItem>::new()));
     provide_context(RwSignal::new(Vec::<Notification>::new()));
+    provide_context(NextNotificationId(RwSignal::new(1)));
 
     view! {
         <style>{STYLE}</style>
