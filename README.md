@@ -46,7 +46,7 @@ cargo leptos watch
 | 10 | [Database](./module-10-database) | SQLx, PgPool, Migrations | SSR | `cargo leptos watch -p module-10-database` |
 | 11 | [Authentication](./module-11-auth) | Cookies, JWT, Password hashing | SSR | `cargo leptos watch -p module-11-auth` |
 | 12 | [State Management](./module-12-state-management) | Local state, Context, RwSignal | CSR | `cd module-12-state-management && trunk serve` |
-| 13 | [Styling and Tailwind](./module-13-styling) | Static classes, Conditional classes, Dynamic styles | CSR | `cd module-13-styling && trunk serve` |
+| 13 | [Styling](./module-13-styling) | Static classes, Conditional classes, Dynamic styles | CSR | `cd module-13-styling && trunk serve` |
 | 14 | [Animations](./module-14-animations) | Transitions, Keyframes, Deferred removal | CSR | `cd module-14-animations && trunk serve` |
 | 15 | [Testing](./module-15-testing) | Native tests, WASM tests, Validation tests | CSR | `cd module-15-testing && trunk serve` |
 | 16 | [WASM Performance](./module-16-wasm-performance) | Binary size, Memos, Batching | CSR | `cd module-16-wasm-performance && trunk serve` |

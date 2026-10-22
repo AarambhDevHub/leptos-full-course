@@ -1,4 +1,4 @@
-//! Module 13: Styling and Tailwind-like Patterns.
+//! Module 13: Styling with classes, style directives and CSS variables.
 //! Topics: class toggles, reactive styles, CSS variables, dark mode.
 //! Run: cd module-13-styling && trunk serve
 //!
@@ -187,7 +187,7 @@ fn App() -> impl IntoView {
     view! {
         <style>{STYLE}</style>
         <main>
-            <h1>"Module 13 - Styling and Tailwind"</h1>
+            <h1>"Module 13 - Styling"</h1>
             <TabBar/>
             <MotionCard/>
             <GradientPreview/>

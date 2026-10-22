@@ -39,17 +39,32 @@ fn main() {
 fn FadeInOut() -> impl IntoView {
     let visible = RwSignal::new(true);
     let mounted = RwSignal::new(true);
-
+    // Every toggle bumps this number. A timer only acts if no newer toggle happened, so a quick
+    // second click can never be undone by the timer of the first one.
+    let generation = RwSignal::new(0_u32);
     view! {
         <section class="panel">
             <h2>"FadeInOut with deferred removal"</h2>
             <button on:click=move |_| {
-                if visible.get() {
+                let current = generation.get_untracked() + 1;
+                generation.set(current);
+                if visible.get_untracked() {
                     visible.set(false);
-                    Timeout::new(420, move || mounted.set(false)).forget();
+                    Timeout::new(420, move || {
+                        if generation.try_get_untracked() == Some(current) {
+                            mounted.set(false);
+                        }
+                    })
+                    .forget();
                 } else {
+                    // Mount first at opacity zero, then fade in on the next frames.
                     mounted.set(true);
-                    visible.set(true);
+                    Timeout::new(30, move || {
+                        if generation.try_get_untracked() == Some(current) {
+                            visible.set(true);
+                        }
+                    })
+                    .forget();
                 }
             }>"Toggle"</button>
             <Show when=move || mounted.get()>
@@ -64,11 +79,6 @@ fn FadeInOut() -> impl IntoView {
         </section>
     }
 }
-
-/// Explains the `slide drawer` step in this lesson.
-///
-/// What it does: renders the `SlideDrawer` component for one focused part of the lesson UI.
-/// Why it matters: Keeping this UI section isolated makes the signal, context, action, or routing pattern easier to study.
 #[component]
 fn SlideDrawer() -> impl IntoView {
     let open = RwSignal::new(false);
@@ -103,19 +113,25 @@ fn SlideDrawer() -> impl IntoView {
 fn AnimatedCounter() -> impl IntoView {
     let target = RwSignal::new(0.0_f64);
     let display = RwSignal::new(0.0_f64);
-
+    // Each animation gets a number. An older loop stops as soon as a newer one starts,
+    // so two loops never fight over `display`.
+    let latest_run = RwSignal::new(0_u32);
     let animate_to = move |next: f64| {
         target.set(next);
-        let from = display.get();
+        let from = display.get_untracked();
+        let run_id = latest_run.get_untracked() + 1;
+        latest_run.set(run_id);
         leptos::task::spawn_local(async move {
             for step in 1..=24 {
                 sleep(Duration::from_millis(16)).await;
+                if latest_run.try_get_untracked() != Some(run_id) {
+                    return;
+                }
                 let t = step as f64 / 24.0;
                 display.set(from + (next - from) * t);
             }
         });
     };
-
     view! {
         <section class="panel">
             <h2>"AnimatedCounter"</h2>
@@ -126,52 +142,54 @@ fn AnimatedCounter() -> impl IntoView {
     }
 }
 
-/// Explains the `staggered list` step in this lesson.
-///
-/// What it does: renders the `StaggeredList` component for one focused part of the lesson UI.
-/// Why it matters: Keeping this UI section isolated makes the signal, context, action, or routing pattern easier to study.
 #[component]
 fn StaggeredList() -> impl IntoView {
     let run = RwSignal::new(0_u32);
     let items = ["Signals", "Effects", "Memos", "Resources", "Actions"];
-
     view! {
         <section class="panel">
             <h2>"StaggeredList"</h2>
             <button on:click=move |_| run.update(|value| *value += 1)>"Replay"</button>
-            <ul class="staggered" data-run=move || run.get().to_string()>
-                {items.into_iter().enumerate().map(|(index, item)| view! {
-                    <li style=format!("animation-delay: {}ms", index * 100)>{item}</li>
-                }).collect_view()}
-            </ul>
+            // A CSS animation only restarts on a brand new element. A closure that returns the same view shape
+            // is patched in place, so use a keyed list whose key changes on every replay: the old list is
+            // removed and a new one is created.
+            <For
+                each=move || vec![run.get()]
+                key=|replay| *replay
+                children=move |_| view! {
+                    <ul class="staggered">
+                        {items.into_iter().enumerate().map(|(index, item)| view! {
+                            <li style=format!("animation-delay: {}ms", index * 100)>{item}</li>
+                        }).collect_view()}
+                    </ul>
+                }
+            />
         </section>
     }
 }
 
-/// Explains the `bouncing ball` step in this lesson.
-///
-/// What it does: renders the `BouncingBall` component for one focused part of the lesson UI.
-/// Why it matters: Keeping this UI section isolated makes the signal, context, action, or routing pattern easier to study.
 #[component]
 fn BouncingBall() -> impl IntoView {
     let running = RwSignal::new(false);
     let y = RwSignal::new(0.0_f64);
     let velocity = RwSignal::new(0.0_f64);
 
-    Interval::new(16, move || {
-        if !running.get() {
+    // Keep the timer in a local store and drop it when the component goes away. With `.forget()` the
+    // timer would run forever, and mounting this component again would start a second one.
+    let timer = StoredValue::new_local(Some(Interval::new(16, move || {
+        if !running.get_untracked() {
             return;
         }
         velocity.update(|value| *value += 0.8);
         y.update(|position| {
-            *position += velocity.get();
+            *position += velocity.get_untracked();
             if *position > 170.0 {
                 *position = 170.0;
                 velocity.update(|value| *value *= -0.72);
             }
         });
-    })
-    .forget();
+    })));
+    on_cleanup(move || timer.set_value(None));
 
     view! {
         <section class="panel">
