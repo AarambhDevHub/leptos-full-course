@@ -29,11 +29,17 @@ fn main() {
 /// What it does: checks a small email validation rule used by the testing lesson.
 /// Why it matters: The test module needs a simple deterministic rule to demonstrate assertions.
 fn validate_email(input: &str) -> bool {
-    input.contains('@')
-        && input
-            .split('@')
-            .last()
-            .is_some_and(|tail| tail.contains('.'))
+    // A quick sanity check, not a full email parser. The only real proof that an address works is
+    // sending a message to it. The edge-case tests at the bottom of this file pin down these rules.
+    let Some((local, domain)) = input.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && !domain.contains('@')
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !input.contains(char::is_whitespace)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -46,6 +52,9 @@ struct Todo {
 #[derive(Clone, Debug, Default)]
 struct TodoState {
     items: Vec<Todo>,
+    /// The id of the last todo that was added. It only ever goes up, so an id is never reused,
+    /// even after a delete. (`items.len() + 1` would hand out an id that is still in the list.)
+    last_id: u32,
 }
 
 impl TodoState {
@@ -54,7 +63,8 @@ impl TodoState {
     /// What it does: implements the `add` operation for this lesson data type or local helper.
     /// Why it matters: Method-sized behavior keeps state transitions small enough to test and explain.
     fn add(&mut self, title: impl Into<String>) -> u32 {
-        let id = self.items.len() as u32 + 1;
+        let id = self.last_id + 1;
+        self.last_id = id;
         self.items.push(Todo {
             id,
             title: title.into(),
@@ -90,10 +100,13 @@ fn format_file_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
     const GB: f64 = MB * 1024.0;
+    // Pick the unit by the number the user will actually see. 1,048,575 bytes is 1023.999 KB, which
+    // rounds to "1024.0 KB", so it must be shown as "1.0 MB" instead.
+    let shown = |value: f64| (value * 10.0).round() / 10.0;
     let bytes_f = bytes as f64;
-    if bytes_f >= GB {
+    if shown(bytes_f / MB) >= 1024.0 {
         format!("{:.1} GB", bytes_f / GB)
-    } else if bytes_f >= MB {
+    } else if shown(bytes_f / KB) >= 1024.0 {
         format!("{:.1} MB", bytes_f / MB)
     } else if bytes_f >= KB {
         format!("{:.1} KB", bytes_f / KB)
@@ -261,5 +274,56 @@ mod wasm_tests {
         assert_eq!(count.get(), 0);
         count.set(5);
         assert_eq!(count.get(), 5);
+    }
+}
+
+#[cfg(test)]
+mod edge_case_tests {
+    //! Tests written after asking, for each helper, "what could still go wrong?".
+    //! The happy-path tests above pass; these look at the edges.
+    use super::*;
+
+    #[test]
+    fn ids_are_never_reused_after_a_delete() {
+        let mut state = TodoState::default();
+        let first = state.add("first");
+        let second = state.add("second");
+        state.delete(first);
+        let third = state.add("third");
+        assert_ne!(third, second, "a new todo must not reuse the id of a todo that is still in the list");
+        let mut ids: Vec<u32> = state.items.iter().map(|todo| todo.id).collect();
+        let count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "every id in the list must be unique");
+    }
+
+    #[test]
+    fn rejects_an_email_with_nothing_before_the_at_sign() {
+        assert!(!validate_email("@b.com"));
+    }
+
+    #[test]
+    fn rejects_an_email_with_two_at_signs() {
+        assert!(!validate_email("a@@b.com"));
+    }
+
+    #[test]
+    fn rejects_domains_that_start_or_end_with_a_dot() {
+        assert!(!validate_email("a@.com"));
+        assert!(!validate_email("a@b."));
+    }
+
+    #[test]
+    fn rejects_an_email_with_a_space() {
+        assert!(!validate_email("a b@c.com"));
+    }
+
+    #[test]
+    fn file_sizes_round_up_into_the_next_unit() {
+        assert_eq!(format_file_size(1023), "1023 B");
+        assert_eq!(format_file_size(1024), "1.0 KB");
+        assert_eq!(format_file_size(1_048_575), "1.0 MB");
+        assert_eq!(format_file_size(1_073_741_823), "1.0 GB");
     }
 }

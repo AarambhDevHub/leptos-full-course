@@ -43,6 +43,15 @@ fn now() -> f64 {
 ///
 /// What it does: performs the `fib` step used by this module.
 /// Why it matters: Naming this step as a function keeps the lesson code readable and gives learners a place to inspect the behavior.
+/// The slowest input the demo accepts. `fib(35)` already takes noticeable time, and the demo calls it eleven times.
+const MAX_FIB_INPUT: u32 = 35;
+
+/// Keeps the benchmark input in a safe range. The `max` attribute on the input only affects the spinner and
+/// form validation: a typed `45` still reaches the handler, and `fib(45)` would freeze the tab.
+fn clamp_fib_input(value: u32) -> u32 {
+    value.clamp(1, MAX_FIB_INPUT)
+}
+
 fn fib(n: u32) -> u64 {
     match n {
         0 => 0,
@@ -66,11 +75,20 @@ fn BatchingBenchmark() -> impl IntoView {
     let c = RwSignal::new(0_i32);
     let unbatched = RwSignal::new(0.0_f64);
     let batched = RwSignal::new(0.0_f64);
+    // Counts how often an effect that reads all three signals runs. This is the honest measure:
+    // the bars below are smaller than the browser's timer precision, so treat them as noise.
+    let effect_runs = RwSignal::new(0_u32);
+    Effect::new(move |_| {
+        let _ = (a.get(), b.get(), c.get());
+        effect_runs.update(|runs| *runs += 1);
+    });
 
     view! {
         <section class="panel">
             <h2>"Signal batching benchmark"</h2>
             <p>{move || format!("a={} b={} c={}", a.get(), b.get(), c.get())}</p>
+            <p>{move || format!("effect runs: {}", effect_runs.get())}</p>
+            <p>"Press either button: the effect runs once for each, because Leptos runs effects after your handler finishes. The timing bars are below the browser's timer precision, so read them as noise."</p>
             <button on:click=move |_| {
                 let start = now();
                 a.update(|value| *value += 1);
@@ -123,6 +141,18 @@ fn MemoBenchmark() -> impl IntoView {
         RAW_FIB_CALLS.fetch_add(1, Ordering::Relaxed);
         fib(input.get())
     };
+    // The call counters are plain atomics, which are not reactive. Copy them into a signal after each
+    // input change (once the page has updated) so the numbers on screen stay current.
+    let counts = RwSignal::new((0_usize, 0_usize));
+    Effect::new(move |_| {
+        input.track();
+        request_animation_frame(move || {
+            counts.set((
+                MEMO_FIB_CALLS.load(Ordering::Relaxed),
+                RAW_FIB_CALLS.load(Ordering::Relaxed),
+            ));
+        });
+    });
 
     view! {
         <section class="panel">
@@ -133,8 +163,8 @@ fn MemoBenchmark() -> impl IntoView {
                 max="35"
                 prop:value=move || input.get().to_string()
                 on:input:target=move |event| {
-                    if let Ok(value) = event.target().value().parse() {
-                        input.set(value);
+                    if let Ok(value) = event.target().value().parse::<u32>() {
+                        input.set(clamp_fib_input(value));
                     }
                 }
             />
@@ -148,11 +178,10 @@ fn MemoBenchmark() -> impl IntoView {
                     {(0..10).map(|index| view! { <p>{index} ": " {raw_fib}</p> }).collect_view()}
                 </div>
             </div>
-            <p>{move || format!(
-                "memo calls: {}, derived calls: {}",
-                MEMO_FIB_CALLS.load(Ordering::Relaxed),
-                RAW_FIB_CALLS.load(Ordering::Relaxed)
-            )}</p>
+            <p>{move || {
+                let (memo_calls, derived_calls) = counts.get();
+                format!("memo calls: {memo_calls}, derived calls: {derived_calls}")
+            }}</p>
         </section>
     }
 }
@@ -200,21 +229,15 @@ fn LazyList() -> impl IntoView {
     view! {
         <section class="panel">
             <h2>"Lazy list"</h2>
-            <p>"The list models an IntersectionObserver strategy by hydrating more rows on demand."</p>
+            <p>"Only the rows revealed so far exist in the page. A production version would reveal more from an IntersectionObserver, or use a virtualized list that keeps just the visible rows."</p>
             <button on:click=move |_| visible.update(|value| *value = (*value + 30).min(200))>"Reveal more"</button>
+            <p>{move || format!("rows in the page: {}", visible.get())}</p>
             <div class="long-list">
+                // The key is the row number, so revealing more rows adds new rows and keeps the existing ones.
                 <For
-                    each=move || { (1..=200).collect::<Vec<_>>() }
+                    each=move || { (1..=visible.get()).collect::<Vec<_>>() }
                     key=|item| *item
-                    children=move |item| view! {
-                        <div class=move || { if item <= visible.get() { "real-row" } else { "placeholder-row" } }>
-                            {move || if item <= visible.get() {
-                                format!("Hydrated row {item}")
-                            } else {
-                                "Placeholder".to_string()
-                            }}
-                        </div>
-                    }
+                    children=|item| view! { <div class="real-row">{format!("Row {item}")}</div> }
                 />
             </div>
         </section>
@@ -279,3 +302,25 @@ button { background: #1f6feb; color: white; cursor: pointer; }
 .placeholder-row { background: #e5e7eb; color: #64748b; }
 code { display: inline-block; background: #111827; color: #e5e7eb; padding: 8px; border-radius: 6px; }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fib_matches_known_values() {
+        assert_eq!(fib(0), 0);
+        assert_eq!(fib(1), 1);
+        assert_eq!(fib(10), 55);
+        assert_eq!(fib(20), 6765);
+    }
+
+    #[test]
+    fn typed_input_is_clamped_to_a_safe_range() {
+        assert_eq!(clamp_fib_input(0), 1);
+        assert_eq!(clamp_fib_input(30), 30);
+        assert_eq!(clamp_fib_input(35), 35);
+        assert_eq!(clamp_fib_input(45), 35);
+        assert_eq!(clamp_fib_input(u32::MAX), 35);
+    }
+}

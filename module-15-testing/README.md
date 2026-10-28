@@ -56,3 +56,15 @@ set_value.update(|n| *n += 1);
 Previous: [Module 14](../module-14-animations)
 
 Next: [Module 16](../module-16-wasm-performance)
+
+## Running the tests
+
+```bash
+# Native tests: pure logic, run anywhere, finish in a fraction of a second
+cargo test -p module-15-testing
+
+# Browser tests (wasm-bindgen-test): need Chrome; wasm-pack downloads the driver
+cd module-15-testing && wasm-pack test --headless --chrome
+```
+
+The nine native tests include six edge-case tests (reused todo ids, email edge cases, and file-size rounding at unit boundaries). They were written first and failed against the original helpers, so they are a good example of the red, green, refactor workflow.
