@@ -24,6 +24,8 @@ No course code needed API changes for 0.8.22.
 - **Module 12:** the cart list showed a stale quantity (a keyed row displayed a captured copy, so "x1" stayed while the summary said 3 items), and notification ids used `len() + 1`, so a new toast could get the id of a live one and never appear. The row now reads its quantity from the cart, and ids come from a counter (`NextNotificationId` newtype in context).
 - **Module 13:** the module was titled "Styling and Tailwind" but contains no Tailwind. It is now simply "Styling".
 - **Module 14:** a quick second click on the fade toggle let the first timer unmount the box (fixed with a generation number, and the fade now also fades in); two animated-counter loops fought over one signal and the number zigzagged (the newest loop now cancels older ones); the Replay button changed an attribute and restarted nothing (the list is now recreated with a keyed `For`); the bouncing ball's interval used `.forget()` and could never stop (now cleaned up with `on_cleanup`).
+- **Module 15:** the module's own tests passed while the code under test had three bugs. Todo ids used `len() + 1` (reused after a delete), `validate_email` accepted `@b.com`, `a@@b.com`, `a@.com`, `a@b.` and addresses with spaces, and `format_file_size` printed `1024.0 KB` for 1,048,575 bytes. Six edge-case tests were written first (they failed), then the helpers were fixed (nine tests pass).
+- **Module 16:** the batching demo timed microseconds, so its bars were noise (it now also shows how often an effect runs: once per click either way); the memo-versus-derived call counts never updated after the first render (they now refresh); a typed value above the input's `max` could call `fib(45)` and freeze the tab (the input is clamped, with unit tests); and the "lazy" list created all 200 rows up front (it now renders only the rows revealed so far).
 - **Module 17:** uploads over 2 MB (Axum's default limit) were silently dropped while the server answered `ok`. The route now allows 10 MB (matching `.env.example`) and returns real errors (`413` for oversized files).
 
 ## How this was verified
@@ -31,6 +33,7 @@ No course code needed API changes for 0.8.22.
 - Type-checked all 25 modules with `cargo check` (CSR, `ssr` and `hydrate`): no errors, no warnings.
 - Built all 25 modules to `wasm32-unknown-unknown`.
 - Ran the 14 CSR modules in jsdom: all mount and survive clicking every button; modules 01, 05, 06 and 07 have behavior tests (counter, form validation, routing, async resources).
+- Ran modules 15 and 16: nine native unit tests (six written first and failing), measured release-build sizes (debug, release, wasm-opt, gzip, brotli), and the memo, batching, untracked-read and lazy-list demos in a simulated browser.
 - Ran modules 12, 13 and 14 in a simulated browser: cart, toasts, localStorage, wizard and theme; class and style directives, CSS variables and dark mode; fade, counter (every DOM update recorded), replay and ball.
 - Hydrated modules 10 and 11 against PostgreSQL 16 and exercised the notes page (edit, optimistic delete, non-English text) and the register, login, logout and admin flows.
 - Hydrated the server-rendered modules 08 and 09 in a simulated browser and exercised real server functions, client-side navigation and head tags.
