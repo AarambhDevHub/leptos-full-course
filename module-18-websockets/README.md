@@ -27,6 +27,7 @@ cargo leptos watch
 | Path | Purpose |
 |------|---------|
 | `/` | Main lesson dashboard |
+| `/ws` | WebSocket chat room (JSON messages, 8 KB limit, invalid messages are dropped) |
 | `/api/*` | Leptos server functions |
 
 ## Key Concepts

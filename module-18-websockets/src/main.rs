@@ -32,7 +32,7 @@ async fn main() {
     use leptos_axum::{generate_route_list, LeptosRoutes};
     use module_18_websockets::app::*;
     use std::sync::OnceLock;
-    use tokio::sync::broadcast;
+    use tokio::sync::broadcast::{self, error::RecvError};
 
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -58,31 +58,72 @@ async fn main() {
     /// Explains the `ws handler` step in this lesson.
     ///
     /// What it does: handles the `ws handler` request path or event callback for this module.
-    /// Why it matters: Handler functions make server and browser events explicit instead of hiding them inside setup code.
+    /// Why it matters: The upgrade is where the server sets the largest message it is willing to read, before any client text is parsed.
     async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
-        ws.on_upgrade(handle_socket)
+        ws.max_message_size(MAX_MESSAGE_BYTES)
+            .max_frame_size(MAX_MESSAGE_BYTES)
+            .on_upgrade(handle_socket)
+    }
+
+    /// Explains the `broadcast` step in this lesson.
+    ///
+    /// What it does: serializes one message and sends it to every connected client.
+    /// Why it matters: The server always re-serializes a message it has validated, so clients only ever receive well-formed JSON.
+    fn broadcast(message: &WsMsg) {
+        if let Ok(text) = serde_json::to_string(message) {
+            let _ = room().send(text);
+        }
     }
 
     /// Explains the `handle socket` step in this lesson.
     ///
-    /// What it does: handles the `handle socket` request path or event callback for this module.
-    /// Why it matters: Handler functions make server and browser events explicit instead of hiding them inside setup code.
+    /// What it does: relays validated messages from one client to the room, and tells the room when that client leaves.
+    /// Why it matters: It keeps the connection alive through pings and binary frames, survives a slow reader that misses messages, and announces a departure even when the browser just vanishes.
     async fn handle_socket(socket: WebSocket) {
         let mut rx = room().subscribe();
         let (mut sender, mut receiver) = socket.split();
 
         let send_task = tokio::spawn(async move {
-            while let Ok(text) = rx.recv().await {
-                if sender.send(Message::Text(text.into())).await.is_err() {
-                    break;
+            loop {
+                match rx.recv().await {
+                    Ok(text) => {
+                        if sender.send(Message::Text(text.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    // A slow client fell more than 64 messages behind. Skip what it missed
+                    // and keep going, instead of silently ending its stream.
+                    Err(RecvError::Lagged(missed)) => {
+                        tracing::warn!("client lagged, skipped {missed} messages");
+                    }
+                    Err(RecvError::Closed) => break,
                 }
             }
         });
 
-        while let Some(Ok(Message::Text(text))) = receiver.next().await {
-            let _ = room().send(text.to_string());
+        let mut joined_as: Option<String> = None;
+        while let Some(Ok(frame)) = receiver.next().await {
+            match frame {
+                Message::Text(text) => match parse_client_message(&text) {
+                    Ok(message) => {
+                        match &message {
+                            WsMsg::Join { user } => joined_as = Some(user.clone()),
+                            WsMsg::Leave { .. } => joined_as = None,
+                            WsMsg::Chat { .. } => {}
+                        }
+                        broadcast(&message);
+                    }
+                    Err(reason) => tracing::debug!("dropped a client message: {reason}"),
+                },
+                Message::Close(_) => break,
+                // Pings and pongs are answered by Axum. Binary frames are not part of our protocol.
+                _ => {}
+            }
         }
 
+        if let Some(user) = joined_as {
+            broadcast(&WsMsg::Leave { user });
+        }
         send_task.abort();
     }
 

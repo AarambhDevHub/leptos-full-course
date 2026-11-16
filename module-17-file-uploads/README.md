@@ -5,7 +5,7 @@
 - File inputs
 - Multipart
 - Validation
-- Upload progress
+- Upload progress and error handling
 - File listing
 - How the concepts fit into a production Leptos 0.8 app
 
@@ -27,7 +27,7 @@ cargo leptos watch
 | Path | Purpose |
 |------|---------|
 | `/` | Main lesson dashboard |
-| `/upload` | Multipart upload endpoint (10 MB limit; larger files get a `413` error) |
+| `/upload` | Multipart upload endpoint (10 MB per request; larger bodies get a `413` error; duplicate names become `name-2.ext`) |
 | `/api/*` | Leptos server functions |
 
 ## Key Concepts

@@ -31,12 +31,11 @@ async fn main() {
     use leptos_axum::{generate_route_list, LeptosRoutes};
     use module_17_file_uploads::app::*;
     use std::path::Path;
+    use tokio::io::AsyncWriteExt;
 
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-
-    const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 
     let conf = get_configuration(None).unwrap();
     let addr = conf.leptos_options.site_addr;
@@ -47,7 +46,9 @@ async fn main() {
     ///
     /// What it does: handles the `upload handler` request path or event callback for this module.
     /// Why it matters: Handler functions make server and browser events explicit instead of hiding them inside setup code.
-    async fn upload_handler(mut multipart: Multipart) -> Result<&'static str, (StatusCode, String)> {
+    async fn upload_handler(
+        mut multipart: Multipart,
+    ) -> Result<&'static str, (StatusCode, String)> {
         tokio::fs::create_dir_all("./uploads")
             .await
             .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
@@ -56,43 +57,56 @@ async fn main() {
             .await
             .map_err(|err| (err.status(), err.body_text()))?
         {
-            let Some(file_name) = field.file_name().map(sanitize_upload_name) else {
+            let Some(file_name) = field.file_name().map(sanitize_file_name) else {
                 continue;
             };
-            let path = Path::new("./uploads").join(file_name);
             // Report failures (for example a file over the size limit) instead of answering "ok".
             let bytes = field
                 .bytes()
                 .await
                 .map_err(|err| (err.status(), err.body_text()))?;
-            tokio::fs::write(path, bytes)
-                .await
-                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+            save_without_overwriting(&file_name, &bytes).await?;
         }
         Ok("ok")
     }
 
-    /// Explains the `sanitize upload name` step in this lesson.
+    /// Explains the `save without overwriting` step in this lesson.
     ///
-    /// What it does: normalizes a multipart upload file name before saving it.
-    /// Why it matters: Multipart file names come from the client, so the server must clean them first.
-    fn sanitize_upload_name(name: &str) -> String {
-        let clean = name
-            .chars()
-            .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
-            .collect::<String>();
-        if clean.is_empty() {
-            "upload.bin".into()
-        } else {
-            clean
+    /// What it does: writes the bytes to `uploads/<name>`, or to `name-2.ext`, `name-3.ext` and so on when that name is taken.
+    /// Why it matters: `create_new` makes "does it exist?" and "create it" one atomic step, so two uploads with the same name can never overwrite each other, even at the same moment.
+    async fn save_without_overwriting(
+        file_name: &str,
+        bytes: &[u8],
+    ) -> Result<(), (StatusCode, String)> {
+        for attempt in 1..=1000 {
+            let path = Path::new("./uploads").join(unique_name(file_name, attempt));
+            match tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .await
+            {
+                Ok(mut file) => {
+                    return file
+                        .write_all(bytes)
+                        .await
+                        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+            }
         }
+        Err((
+            StatusCode::CONFLICT,
+            "too many files share that name".into(),
+        ))
     }
 
     let app = Router::new()
         // Axum rejects bodies over 2 MB by default; allow up to the 10 MB advertised in .env.example.
         .route(
             "/upload",
-            post(upload_handler).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+            post(upload_handler).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES as usize)),
         )
         .leptos_routes(&leptos_options, routes, {
             let leptos_options = leptos_options.clone();

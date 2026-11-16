@@ -27,6 +27,7 @@ cargo leptos watch
 | Path | Purpose |
 |------|---------|
 | `/` | Main lesson dashboard |
+| `/sse/clock`, `/sse/ticks`, `/sse/progress`, `/sse/notifications` | Named server-sent event streams (`progress` ends with a `done` event) |
 | `/api/*` | Leptos server functions |
 
 ## Key Concepts

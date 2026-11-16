@@ -25,7 +25,7 @@ async fn main() {
         routing::get,
         Router,
     };
-    use futures_util::StreamExt;
+    use futures_util::{stream, StreamExt};
     use leptos::logging::log;
     use leptos::prelude::*;
     use leptos_axum::{generate_route_list, LeptosRoutes};
@@ -71,18 +71,23 @@ async fn main() {
 
     /// Explains the `progress stream` step in this lesson.
     ///
-    /// What it does: implements the `progress stream` operation for this lesson data type or local helper.
-    /// Why it matters: Method-sized behavior keeps state transitions small enough to test and explain.
+    /// What it does: sends progress 0 to 100, then a `done` event, then ends.
+    /// Why it matters: When a stream just ends, the browser treats it as a dropped connection and reconnects, so the progress restarted from zero forever. A final `done` event lets the client close the stream on purpose.
     async fn progress_stream() -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
-        let stream = IntervalStream::new(tokio::time::interval(Duration::from_secs(1)))
+        let steps = IntervalStream::new(tokio::time::interval(Duration::from_secs(1)))
             .take(11)
             .enumerate()
             .map(|(step, _)| {
-                Ok(Event::default()
-                    .event("progress")
-                    .data((step * 10).to_string()))
+                Ok::<_, Infallible>(
+                    Event::default()
+                        .event("progress")
+                        .data((step * 10).to_string()),
+                )
             });
-        Sse::new(stream).keep_alive(KeepAlive::default())
+        let finished = stream::once(async {
+            Ok::<_, Infallible>(Event::default().event("done").data("complete"))
+        });
+        Sse::new(steps.chain(finished)).keep_alive(KeepAlive::default())
     }
 
     /// Explains the `notification stream` step in this lesson.

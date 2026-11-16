@@ -17,6 +17,13 @@ use serde::{Deserialize, Serialize};
 
 const MODULE_TITLE: &str = "Module 17 - File Uploads";
 
+/// The most bytes one upload request may carry. The server enforces it (HTTP 413) and the
+/// browser checks it first, so the user hears about a too-large file before waiting for it.
+pub const MAX_UPLOAD_BYTES: u64 = 10 * 1024 * 1024;
+
+/// A multipart body is a little bigger than the files inside it (boundaries and headers).
+const MULTIPART_OVERHEAD_PER_FILE: u64 = 1024;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct FileInfo {
     name: String,
@@ -129,15 +136,14 @@ pub async fn delete_file(name: String) -> Result<(), ServerFnError> {
 
 /// Explains the `sanitize name` step in this lesson.
 ///
-/// What it does: normalizes an uploaded file name before touching the filesystem.
+/// What it does: checks that a name given to `delete_file` is already a clean, stored name.
 /// Why it matters: Filesystem examples must prevent path traversal and unsafe file names.
 #[cfg(feature = "ssr")]
 fn sanitize_name(name: &str) -> Result<String, ServerFnError> {
-    let clean = name
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
-        .collect::<String>();
-    if clean.is_empty() || clean == "." || clean == ".." {
+    // Stored names always come out of `sanitize_file_name`, so a name that changes when
+    // cleaned again was not produced by us (for example "../x") and is refused.
+    let clean = sanitize_file_name(name);
+    if clean != name {
         return Err(ServerFnError::new("invalid file name"));
     }
     Ok(clean)
@@ -162,15 +168,15 @@ fn UploadPage() -> impl IntoView {
                 <h1>{MODULE_TITLE}</h1>
                 <p>"Select or drop files to inspect browser metadata, then send them through the multipart upload route."</p>
             </header>
-            <UploadZone selected progress dragover upload_version/>
+            <UploadZone selected progress dragover upload_version error/>
             <ProgressBar progress/>
+            <p style="color: #b91c1c; min-height: 1.2em;">{error}</p>
             <SelectedFiles files=selected/>
             <section style="border: 1px solid #d9dee8; border-radius: 8px; padding: 20px;">
                 <div style="display: flex; justify-content: space-between; align-items: center;">
                     <h2>"Files on server"</h2>
                     <button on:click=move |_| uploaded.refetch()>"Refresh"</button>
                 </div>
-                <p style="color: #b91c1c;">{error}</p>
                 <Suspense fallback=|| view! { <p>"Reading uploads directory..."</p> }>
                     {move || uploaded.get().map(|result| match result {
                         Ok(files) if files.is_empty() => view! { <p>"No uploaded files yet."</p> }.into_any(),
@@ -217,12 +223,14 @@ fn UploadZone(
     progress: RwSignal<f64>,
     dragover: RwSignal<bool>,
     upload_version: RwSignal<u32>,
+    error: RwSignal<String>,
 ) -> impl IntoView {
     #[cfg(not(feature = "hydrate"))]
     {
         let _ = selected;
         let _ = progress;
         let _ = upload_version;
+        let _ = error;
     }
 
     view! {
@@ -242,7 +250,7 @@ fn UploadZone(
                 #[cfg(feature = "hydrate")]
                 if let Some(list) = event.data_transfer().and_then(|data| data.files()) {
                     selected.set(files_from_list(&list));
-                    start_upload(&list, progress, upload_version);
+                    start_upload(&list, progress, upload_version, error);
                 }
             }
         >
@@ -257,7 +265,7 @@ fn UploadZone(
                     #[cfg(feature = "hydrate")]
                     if let Some(list) = event.target().files() {
                         selected.set(files_from_list(&list));
-                        start_upload(&list, progress, upload_version);
+                        start_upload(&list, progress, upload_version, error);
                     }
                 }
             />
@@ -283,15 +291,31 @@ fn files_from_list(list: &web_sys::FileList) -> Vec<FileInfo> {
 
 /// Explains the `start upload` step in this lesson.
 ///
-/// What it does: builds multipart `FormData` from the selected browser files and posts it to `/upload` with XHR progress events.
-/// Why it matters: Upload progress only means something when the same request body is also sent to the Axum upload route.
+/// What it does: checks the total size, builds multipart `FormData` from the selected browser files and posts it to `/upload` with XHR progress events.
+/// Why it matters: The `load` event fires for every answer, even `413`, so the status is read before the upload is called a success, and network failures get their own message.
 #[cfg(feature = "hydrate")]
-fn start_upload(list: &web_sys::FileList, progress: RwSignal<f64>, upload_version: RwSignal<u32>) {
+fn start_upload(
+    list: &web_sys::FileList,
+    progress: RwSignal<f64>,
+    upload_version: RwSignal<u32>,
+    error: RwSignal<String>,
+) {
     use wasm_bindgen::closure::Closure;
     use wasm_bindgen::JsCast;
 
     progress.set(0.0);
+    error.set(String::new());
     if list.length() == 0 {
+        return;
+    }
+
+    // Courtesy check: refuse early, with a clear message, instead of sending megabytes for a 413.
+    let sizes: Vec<u64> = (0..list.length())
+        .filter_map(|index| list.item(index))
+        .map(|file| file.size() as u64)
+        .collect();
+    if let Err(message) = check_upload_size(&sizes) {
+        error.set(message);
         return;
     }
 
@@ -324,12 +348,31 @@ fn start_upload(list: &web_sys::FileList, progress: RwSignal<f64>, upload_versio
         on_progress.forget();
     }
 
-    let on_load = Closure::<dyn FnMut()>::wrap(Box::new(move || {
-        progress.set(1.0);
-        upload_version.update(|version| *version += 1);
+    // `load` means "an answer arrived", not "the answer was good": read the status.
+    let on_load = Closure::<dyn FnMut()>::wrap(Box::new({
+        let xhr = xhr.clone();
+        move || {
+            let status = xhr.status().unwrap_or(0);
+            if (200..300).contains(&status) {
+                progress.set(1.0);
+                upload_version.update(|version| *version += 1);
+            } else {
+                progress.set(0.0);
+                let body = xhr.response_text().ok().flatten().unwrap_or_default();
+                error.set(upload_error_message(status, &body));
+            }
+        }
     }));
     xhr.set_onload(Some(on_load.as_ref().unchecked_ref()));
     on_load.forget();
+
+    // `error` fires when no answer arrived at all (offline, connection reset).
+    let on_error = Closure::<dyn FnMut()>::wrap(Box::new(move || {
+        progress.set(0.0);
+        error.set(upload_error_message(0, ""));
+    }));
+    xhr.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+    on_error.forget();
 
     let _ = xhr.send_with_opt_form_data(Some(&form));
 }
@@ -387,16 +430,105 @@ fn SelectedFiles(files: RwSignal<Vec<FileInfo>>) -> impl IntoView {
 /// Explains the `format size` step in this lesson.
 ///
 /// What it does: formats a byte count into a learner-friendly file size.
-/// Why it matters: Formatting helpers keep UI code readable and reusable.
-fn format_size(bytes: u64) -> String {
-    const KB: f64 = 1024.0;
-    let bytes = bytes as f64;
-    if bytes < KB {
-        format!("{bytes:.0} B")
-    } else if bytes < KB * KB {
-        format!("{:.1} KB", bytes / KB)
+/// Why it matters: The unit is chosen from the rounded number the user will see, so the screen
+/// can never say `1024.0 KB` (the boundary bug from module 15, found here again).
+pub fn format_size(bytes: u64) -> String {
+    const STEP: f64 = 1024.0;
+    let value = bytes as f64;
+    // Round exactly like the printing below, then decide the unit from that rounded number.
+    let shown = |number: f64| (number * 10.0).round() / 10.0;
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if shown(value / STEP) < STEP {
+        format!("{:.1} KB", value / STEP)
+    } else if shown(value / STEP / STEP) < STEP {
+        format!("{:.1} MB", value / STEP / STEP)
     } else {
-        format!("{:.1} MB", bytes / KB / KB)
+        format!("{:.1} GB", value / STEP / STEP / STEP)
+    }
+}
+
+/// Explains the `sanitize file name` step in this lesson.
+///
+/// What it does: turns a client-supplied file name into a safe name for the uploads folder.
+/// Why it matters: The name comes from the client, so we keep only the last path segment, drop
+/// unsafe characters, never return an empty or hidden name, and keep the extension even when
+/// the rest of the name (for example Hindi letters) has to be replaced.
+pub fn sanitize_file_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let keep = |part: &str| -> String {
+        part.chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+            .collect()
+    };
+    let (stem, extension) = match base.rsplit_once('.') {
+        Some((stem, extension)) => (stem, extension),
+        None => (base, ""),
+    };
+    let stem = keep(stem);
+    let stem = stem.trim_start_matches('.');
+    let stem: String = if stem.is_empty() {
+        "upload".into()
+    } else {
+        stem.chars().take(100).collect()
+    };
+    let extension: String = keep(extension)
+        .chars()
+        .filter(|ch| *ch != '.')
+        .take(16)
+        .collect();
+    if extension.is_empty() {
+        stem
+    } else {
+        format!("{stem}.{extension}")
+    }
+}
+
+/// Explains the `unique name` step in this lesson.
+///
+/// What it does: builds the name to try on attempt number `attempt` (1 is the plain name,
+/// 2 is `name-2.ext`, and so on).
+/// Why it matters: Two uploads with the same name must never silently overwrite each other.
+pub fn unique_name(name: &str, attempt: u32) -> String {
+    if attempt <= 1 {
+        return name.to_string();
+    }
+    match name.rsplit_once('.') {
+        Some((stem, extension)) => format!("{stem}-{attempt}.{extension}"),
+        None => format!("{name}-{attempt}"),
+    }
+}
+
+/// Explains the `check upload size` step in this lesson.
+///
+/// What it does: decides whether the selected files fit in one upload request.
+/// Why it matters: The browser can refuse early with a clear message. The server still checks
+/// too, because a browser check is only a courtesy and never a guard.
+pub fn check_upload_size(sizes: &[u64]) -> Result<(), String> {
+    let total: u64 = sizes.iter().sum::<u64>() + MULTIPART_OVERHEAD_PER_FILE * sizes.len() as u64;
+    if total > MAX_UPLOAD_BYTES {
+        return Err(format!(
+            "These files add up to {}, but one upload may carry at most {}.",
+            format_size(total),
+            format_size(MAX_UPLOAD_BYTES)
+        ));
+    }
+    Ok(())
+}
+
+/// Explains the `upload error message` step in this lesson.
+///
+/// What it does: turns the HTTP status of a finished upload into a message for the user.
+/// Why it matters: An XHR `load` event fires for every answer, including errors, so the status
+/// must be read before the upload is called a success.
+pub fn upload_error_message(status: u16, body: &str) -> String {
+    match status {
+        0 => "The upload did not reach the server. Check your connection and try again.".into(),
+        413 => format!(
+            "The server refused the upload because it is too large (limit {}).",
+            format_size(MAX_UPLOAD_BYTES)
+        ),
+        _ => format!("Upload failed (HTTP {status}): {}", body.trim()),
     }
 }
 
@@ -411,5 +543,86 @@ fn NotFound() -> impl IntoView {
             <h1>"404"</h1>
             <p>"The requested upload route does not exist."</p>
         </section>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_round_sizes() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(1023), "1023 B");
+        assert_eq!(format_size(1024), "1.0 KB");
+        assert_eq!(format_size(1024 * 1024), "1.0 MB");
+    }
+
+    #[test]
+    fn never_prints_a_thousand_and_twenty_four_of_a_unit() {
+        // One byte below a megabyte used to print "1024.0 KB" (the module 15 bug, again).
+        assert_eq!(format_size(1_048_575), "1.0 MB");
+        assert_eq!(format_size(1_073_741_823), "1.0 GB");
+        assert!(!format_size(1_048_575).contains("1024"));
+    }
+
+    #[test]
+    fn keeps_the_extension_when_the_name_is_not_ascii() {
+        assert_eq!(sanitize_file_name("रिपोर्ट.txt"), "upload.txt");
+        assert_eq!(sanitize_file_name("नोट्स.txt"), "upload.txt");
+    }
+
+    #[test]
+    fn removes_paths_and_hidden_names() {
+        assert_eq!(sanitize_file_name("../../evil.txt"), "evil.txt");
+        assert_eq!(sanitize_file_name("C:\\temp\\photo.png"), "photo.png");
+        assert_eq!(sanitize_file_name(".."), "upload");
+        assert_eq!(sanitize_file_name("."), "upload");
+        assert_eq!(sanitize_file_name(".bashrc"), "upload.bashrc");
+        assert_eq!(sanitize_file_name(""), "upload");
+    }
+
+    #[test]
+    fn keeps_normal_names_unchanged() {
+        assert_eq!(
+            sanitize_file_name("report-2026_v2.pdf"),
+            "report-2026_v2.pdf"
+        );
+        assert_eq!(sanitize_file_name("archive.tar.gz"), "archive.tar.gz");
+        assert_eq!(sanitize_file_name("my file (1).png"), "myfile1.png");
+    }
+
+    #[test]
+    fn a_clean_name_is_a_fixed_point() {
+        for name in ["a.txt", "upload", "upload.bin", "x-y_z.tar.gz"] {
+            assert_eq!(
+                sanitize_file_name(&sanitize_file_name(name)),
+                sanitize_file_name(name)
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_names_get_a_counter_before_the_extension() {
+        assert_eq!(unique_name("dup.txt", 1), "dup.txt");
+        assert_eq!(unique_name("dup.txt", 2), "dup-2.txt");
+        assert_eq!(unique_name("dup", 3), "dup-3");
+        assert_eq!(unique_name("a.tar.gz", 2), "a.tar-2.gz");
+    }
+
+    #[test]
+    fn size_check_has_a_boundary() {
+        assert!(check_upload_size(&[]).is_ok());
+        assert!(check_upload_size(&[MAX_UPLOAD_BYTES - 1024]).is_ok());
+        assert!(check_upload_size(&[MAX_UPLOAD_BYTES - 1023]).is_err());
+        // Several small files can still be too much together.
+        assert!(check_upload_size(&[4 * 1024 * 1024; 3]).is_err());
+    }
+
+    #[test]
+    fn error_messages_match_the_status() {
+        assert!(upload_error_message(413, "x").contains("too large"));
+        assert!(upload_error_message(0, "").contains("did not reach"));
+        assert!(upload_error_message(500, " boom ").contains("(HTTP 500): boom"));
     }
 }
