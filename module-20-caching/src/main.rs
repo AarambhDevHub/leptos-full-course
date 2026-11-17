@@ -20,11 +20,27 @@
 #[cfg(feature = "ssr")]
 #[tokio::main]
 async fn main() {
+    use axum::http::{header::CACHE_CONTROL, HeaderValue};
+    use axum::response::Response;
     use axum::Router;
     use leptos::logging::log;
     use leptos::prelude::*;
     use leptos_axum::{generate_route_list, LeptosRoutes};
     use module_20_caching::app::*;
+    use tower_http::compression::CompressionLayer;
+    use tower_http::services::ServeDir;
+
+    /// Explains the `revalidate headers` step in this lesson.
+    ///
+    /// What it does: tells browsers to keep the files but ask the server before reusing them.
+    /// Why it matters: The files in `pkg` are not fingerprinted by default, so a long max-age would keep serving an old WebAssembly file after a deploy. With `must-revalidate` the browser sends its `If-Modified-Since` and the server answers `304` with no body. With `hash-files` turned on, the names change on every build and you may switch to a one year `immutable` policy.
+    async fn revalidate_headers(mut response: Response) -> Response {
+        response.headers_mut().insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=0, must-revalidate"),
+        );
+        response
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -35,7 +51,18 @@ async fn main() {
     let leptos_options = conf.leptos_options;
     let routes = generate_route_list(App);
 
+    // Static files get gzip, `Last-Modified` with `304` answers, and an explicit cache policy.
+    let pkg_dir = format!(
+        "{}/{}",
+        leptos_options.site_root, leptos_options.site_pkg_dir
+    );
+    let pkg_files = Router::new()
+        .fallback_service(ServeDir::new(pkg_dir))
+        .layer(CompressionLayer::new())
+        .layer(axum::middleware::map_response(revalidate_headers));
+
     let app = Router::new()
+        .nest("/pkg", pkg_files)
         .leptos_routes(&leptos_options, routes, {
             let leptos_options = leptos_options.clone();
             move || shell(leptos_options.clone())

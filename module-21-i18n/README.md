@@ -40,11 +40,11 @@ set_value.update(|n| *n += 1);
 
 ## Working Examples
 
-- Language switcher
-- Modal
+- Language switcher (English, Spanish, Hindi, Arabic) with saved choice and browser detection
+- Right-to-left layout (`lang` and `dir` on the page)
 - Accessible form
-- Live region
-- Keyboard menu
+- Live region that announces only real saves
+- Keyboard menu with arrow keys
 
 ## Try It
 

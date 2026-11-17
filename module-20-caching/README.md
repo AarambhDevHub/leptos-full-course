@@ -27,7 +27,9 @@ cargo leptos watch
 | Path | Purpose |
 |------|---------|
 | `/` | Main lesson dashboard |
-| `/api/*` | Leptos server functions |
+| `/api/cached_headline` | GET server function with `Cache-Control` (browser HTTP cache) |
+| `/api/*` | Other Leptos server functions (POST) |
+| `/pkg/*` | Static files: gzip, `Last-Modified` with `304`, `Cache-Control: must-revalidate` |
 
 ## Key Concepts
 
@@ -41,11 +43,12 @@ set_value.update(|n| *n += 1);
 
 ## Working Examples
 
-- SWR
-- Pagination
-- Infinite scroll
-- Dashboard
-- Cache headers
+- SWR (manual, in a signal)
+- HTTP cache on a GET server function
+- Pagination with server-side limits
+- Infinite scroll that waits for each page
+- Dashboard polling with backoff and cleanup
+- Static file caching and compression
 
 ## Try It
 
