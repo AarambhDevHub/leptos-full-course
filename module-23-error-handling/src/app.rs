@@ -18,6 +18,103 @@ use std::{error::Error, fmt};
 
 const MODULE_TITLE: &str = "Module 23 - Error Handling";
 
+/// The longest piece of a client error report that is written to the log.
+pub const MAX_LOG_FIELD: usize = 500;
+
+/// The kinds of data the demo server function knows about.
+#[cfg_attr(not(feature = "ssr"), allow(dead_code))]
+const KNOWN_KINDS: [&str; 4] = ["profile", "inventory", "shipping", "always-fail"];
+
+/// Explains the `clean log field` step in this lesson.
+///
+/// What it does: makes text from the browser safe to write into a log line: line breaks and other control characters are shown as visible escapes, and long text is cut.
+/// Why it matters: The error report endpoint is public. Without this, one request could add a fake log line (`real message` then a new line that looks like `INFO admin logged in`), or write two megabytes into the log.
+pub fn clean_log_field(raw: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (count, ch) in raw.chars().enumerate() {
+        if count >= max_chars {
+            out.push_str("...");
+            break;
+        }
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push(' '),
+            c if c.is_control() => out.push('?'),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Explains the `log budget` step in this lesson.
+///
+/// What it does: counts how many error reports were accepted in the current minute, and says no after thirty.
+/// Why it matters: One broken page in a loop, or one bad visitor, could otherwise write thousands of lines per second and fill the disk.
+#[derive(Debug)]
+pub struct LogBudget {
+    window_start: Option<u64>,
+    used: u32,
+}
+
+impl LogBudget {
+    pub const WINDOW_SECS: u64 = 60;
+    pub const MAX_PER_WINDOW: u32 = 30;
+
+    pub const fn new() -> Self {
+        Self {
+            window_start: None,
+            used: 0,
+        }
+    }
+
+    /// Asks for one more report at time `now` (seconds). Returns `false` when the budget is spent.
+    pub fn allow(&mut self, now: u64) -> bool {
+        let expired = match self.window_start {
+            Some(start) => now.saturating_sub(start) >= Self::WINDOW_SECS,
+            None => true,
+        };
+        if expired {
+            self.window_start = Some(now);
+            self.used = 0;
+        }
+        if self.used < Self::MAX_PER_WINDOW {
+            self.used += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Default for LogBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "ssr")]
+static LOG_BUDGET: std::sync::Mutex<LogBudget> = std::sync::Mutex::new(LogBudget::new());
+
+/// Explains the `restore in order` step in this lesson.
+///
+/// What it does: puts a deleted item back where it used to be, judged by the original order of the list and not by an old index.
+/// Why it matters: The old rollback inserted the item at the index it had when it was clicked. If another item was deleted in the meantime, that index was wrong and the item came back in the wrong place.
+fn restore_in_order(list: &mut Vec<Item>, item: Item, original_order: &[u32]) {
+    let rank = |id: u32| {
+        original_order
+            .iter()
+            .position(|candidate| *candidate == id)
+            .unwrap_or(usize::MAX)
+    };
+    let item_rank = rank(item.id);
+    let index = list
+        .iter()
+        .position(|existing| rank(existing.id) > item_rank)
+        .unwrap_or(list.len());
+    list.insert(index, item);
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Item {
     id: u32,
@@ -82,18 +179,18 @@ pub fn App() -> impl IntoView {
         <Router>
             <main style="max-width: 1080px; margin: 0 auto; padding: 32px; font-family: system-ui, sans-serif;">
                 <ErrorBoundary fallback=|errors| {
-                    let message = errors
-                        .get()
-                        .into_iter()
-                        .map(|(_, error)| error.to_string())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    leptos::task::spawn_local({
-                        let message = message.clone();
-                        async move {
-                            let _ = log_client_error(message, "root-boundary".into()).await;
+                    // Report once per change of the errors. An effect does not run during server
+                    // rendering, and it does not repeat when the fallback is only re-drawn.
+                    Effect::new({
+                        let errors = errors.clone();
+                        move |_| {
+                            let report = join_errors(&errors.get());
+                            leptos::task::spawn_local(async move {
+                                let _ = log_client_error(report, "root-boundary".into()).await;
+                            });
                         }
                     });
+                    let message = join_errors(&errors.get_untracked());
                     view! {
                         <section style="border: 1px solid #fecaca; border-radius: 8px; padding: 20px; background: #fef2f2;">
                             <h1>"Crash report"</h1>
@@ -122,6 +219,19 @@ pub fn App() -> impl IntoView {
     }
 }
 
+/// Explains the `join errors` step in this lesson.
+///
+/// What it does: turns the errors caught by a boundary into one text, one error per line.
+/// Why it matters: The crash report and the report sent to the server must show the same text.
+fn join_errors(errors: &Errors) -> String {
+    errors
+        .clone()
+        .into_iter()
+        .map(|(_, error)| error.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // ============================================================================
 // LESSON 3: Server Functions And Trusted Work
 // ============================================================================
@@ -132,6 +242,10 @@ pub fn App() -> impl IntoView {
 /// Why it matters: It demonstrates how Leptos keeps trusted work on the server while preserving a Rust function call shape in the UI.
 #[server]
 pub async fn unstable_data(kind: String, attempt: u32) -> Result<String, ServerFnError> {
+    // A public door: only the kinds this demo knows are accepted, so a caller cannot make the server echo a huge text.
+    if !KNOWN_KINDS.contains(&kind.as_str()) {
+        return Err(ServerFnError::ServerError("unknown kind".into()));
+    }
     if kind == "always-fail" || attempt < 2 {
         return Err(ServerFnError::ServerError(format!(
             "{kind} failed on attempt {attempt}"
@@ -162,7 +276,26 @@ pub async fn delete_item_remote(id: u32) -> Result<(), ServerFnError> {
 #[server]
 pub async fn log_client_error(msg: String, stack: String) -> Result<(), ServerFnError> {
     #[cfg(feature = "ssr")]
-    tracing::error!(message = %msg, stack = %stack, "client error captured");
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        let allowed = LOG_BUDGET
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .allow(now);
+        if !allowed {
+            return Err(ServerFnError::ServerError("too many error reports".into()));
+        }
+        tracing::error!(
+            message = %clean_log_field(&msg, MAX_LOG_FIELD),
+            stack = %clean_log_field(&stack, MAX_LOG_FIELD),
+            "client error captured"
+        );
+    }
+    #[cfg(not(feature = "ssr"))]
+    let _ = (&msg, &stack);
     Ok(())
 }
 
@@ -208,7 +341,7 @@ fn RetryResource() -> impl IntoView {
                     Err(error) => view! {
                         <div style="color: #b91c1c;">
                             <p>{error.to_string()}</p>
-                            <button on:click=move |_| attempt.update(|value| *value += 1)>"Retry with backoff"</button>
+                            <button on:click=move |_| attempt.update(|value| *value += 1)>"Retry"</button>
                         </div>
                     }.into_any(),
                 })}
@@ -283,11 +416,19 @@ fn OptimisticRollback() -> impl IntoView {
         },
     ]);
     let toast = RwSignal::new(String::new());
+    // The order the list had at the start, used to put a failed delete back in the right place.
+    let original_order = StoredValue::new(
+        items
+            .get_untracked()
+            .iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+    );
 
     view! {
         <section style="border: 1px solid #d9dee8; border-radius: 8px; padding: 20px;">
             <h2>"Optimistic rollback"</h2>
-            <p style="color: #b91c1c;">{toast}</p>
+            <p role="alert" style="color: #b91c1c;">{toast}</p>
             <ul style="display: grid; gap: 8px; padding-left: 0; list-style: none;">
                 <For
                     each=move || items.get()
@@ -299,12 +440,11 @@ fn OptimisticRollback() -> impl IntoView {
                                 <span>{item.title.clone()}</span>
                                 <button on:click=move |_| {
                                     let original = item.clone();
-                                    let position = items.read().iter().position(|candidate| candidate.id == id).unwrap_or(0);
                                     items.update(|list| list.retain(|candidate| candidate.id != id));
                                     toast.set(String::new());
                                     leptos::task::spawn_local(async move {
                                         if let Err(error) = delete_item_remote(id).await {
-                                            items.update(|list| list.insert(position.min(list.len()), original));
+                                            items.update(|list| restore_in_order(list, original, &original_order.get_value()));
                                             toast.set(error.to_string());
                                         }
                                     });
@@ -329,5 +469,72 @@ fn NotFound() -> impl IntoView {
             <h1>"404"</h1>
             <p>"The requested error-handling route does not exist."</p>
         </section>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(id: u32) -> Item {
+        Item {
+            id,
+            title: format!("item {id}"),
+        }
+    }
+
+    fn ids(list: &[Item]) -> Vec<u32> {
+        list.iter().map(|item| item.id).collect()
+    }
+
+    #[test]
+    fn log_fields_cannot_forge_a_new_line() {
+        let cleaned = clean_log_field("real\n2026-01-01 INFO fake: admin logged in\r\n", 500);
+        assert!(!cleaned.contains('\n') && !cleaned.contains('\r'));
+        assert!(cleaned.starts_with("real\\n2026-01-01"));
+        assert_eq!(clean_log_field("a\u{1b}[31mb", 50), "a?[31mb");
+    }
+
+    #[test]
+    fn log_fields_are_cut() {
+        let long = "x".repeat(2_000_000);
+        let cleaned = clean_log_field(&long, MAX_LOG_FIELD);
+        assert_eq!(cleaned.len(), MAX_LOG_FIELD + 3);
+        assert!(cleaned.ends_with("..."));
+        // Hindi counts as characters, not bytes.
+        assert_eq!(clean_log_field("नमस्ते", 100), "नमस्ते");
+    }
+
+    #[test]
+    fn the_log_budget_is_spent_then_renewed() {
+        let mut budget = LogBudget::new();
+        for _ in 0..LogBudget::MAX_PER_WINDOW {
+            assert!(budget.allow(1_000));
+        }
+        assert!(!budget.allow(1_000));
+        assert!(!budget.allow(1_059));
+        assert!(budget.allow(1_060));
+    }
+
+    #[test]
+    fn a_failed_delete_returns_to_its_place() {
+        let order = [1, 2, 3];
+        // Delete 2 (it will fail later), then delete 1 (it succeeds): list is [3].
+        let mut list = vec![item(3)];
+        restore_in_order(&mut list, item(2), &order);
+        assert_eq!(ids(&list), vec![2, 3]);
+        // The old index based code gave [3, 2] here.
+        let mut list = vec![item(1), item(2)];
+        restore_in_order(&mut list, item(3), &order);
+        assert_eq!(ids(&list), vec![1, 2, 3]);
+        let mut list = vec![item(2), item(3)];
+        restore_in_order(&mut list, item(1), &order);
+        assert_eq!(ids(&list), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn only_known_kinds_are_accepted() {
+        assert!(KNOWN_KINDS.contains(&"profile"));
+        assert!(!KNOWN_KINDS.contains(&"anything-else"));
     }
 }

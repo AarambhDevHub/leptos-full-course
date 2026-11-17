@@ -9,7 +9,10 @@ leptos = { workspace = true, features = ["csr"] }
 # Better panic messages in the browser console during course demos.
 console_error_panic_hook = { workspace = true }
 # Browser DOM types used by event handlers and direct API examples.
-web-sys = { workspace = true }
+web-sys = { workspace = true, features = ["Clipboard"] }
+# Closures for IntersectionObserver callbacks, and promises for the clipboard.
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
 # Timers are used by debounce, animation, and async client examples.
 gloo-timers = { workspace = true }
 # Browser storage is used by persistence-oriented modules.
@@ -18,7 +21,7 @@ gloo-storage = { workspace = true }
 gloo-events = { workspace = true }
 # HTTP fetch helpers are used by async resource modules.
 gloo-net = { workspace = true }
-# Direct JavaScript evaluation for interop demos.
+# JavaScript values, `eval` for the Chart.js bridge, and `Reflect` for feature checks.
 js-sys = { workspace = true }
 # Serialization support for client-side examples.
 serde = { workspace = true }

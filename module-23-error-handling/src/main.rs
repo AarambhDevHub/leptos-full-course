@@ -9,6 +9,11 @@
 //! comments that explain both what each function does and why it
 //! matters in a Leptos application.
 
+// Nested boundaries, suspense and resources make a deep view type. Without this
+// the compiler stops with "queries overflow the depth limit" when it lays out
+// the route list in `main`.
+#![recursion_limit = "512"]
+
 // ============================================================================
 // LESSON 1: Starting The Axum And Leptos Server
 // ============================================================================
@@ -35,12 +40,15 @@ async fn main() {
     let leptos_options = conf.leptos_options;
     let routes = generate_route_list(App);
 
+    // Every request here is tiny. A small body limit stops a two megabyte "error report" before it is read.
     let app = Router::new()
         .leptos_routes(&leptos_options, routes, {
             let leptos_options = leptos_options.clone();
             move || shell(leptos_options.clone())
         })
         .fallback(leptos_axum::file_and_error_handler(shell))
+        // A layer only covers the routes added before it, so it comes after the routes and the fallback.
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
         .with_state(leptos_options);
 
     log!("listening on http://{}", &addr);

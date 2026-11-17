@@ -41,11 +41,15 @@ set_value.update(|n| *n += 1);
 
 ## Working Examples
 
-- Retry resource
-- Partial failure
-- Rollback
-- Global boundary
-- Error log
+- Retry resource (plain retry; adding a real delay is homework)
+- Partial failure (only the failing card shows an error)
+- Rollback (a failed delete returns to its original place)
+- Global boundary (reports the crash once per change)
+- Error log (public endpoint: text is cleaned and cut, 30 reports per minute, 64 KB body limit)
+
+Note: validation and expected failures of server functions answer with HTTP status 500 and a message. Choosing a status such as 400 is left as homework.
+
+Run the unit tests with `cargo test -p module-23-error-handling`.
 
 ## Try It
 

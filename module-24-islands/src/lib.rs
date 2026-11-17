@@ -19,5 +19,6 @@ pub mod app;
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn hydrate() {
     console_error_panic_hook::set_once();
-    leptos::mount::hydrate_body(crate::app::App);
+    // Wake up only the islands that are on the page, not the whole app.
+    leptos::mount::hydrate_islands();
 }

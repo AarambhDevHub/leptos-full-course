@@ -40,11 +40,13 @@ set_value.update(|n| *n += 1);
 
 ## Working Examples
 
-- Local storage
-- Clipboard
-- Observer
-- Chart
-- Event bus
+- Local storage (every call reports its real result, including "storage is blocked")
+- Clipboard (the asynchronous API; it needs https or localhost)
+- IntersectionObserver (a real observer, disconnected when the panel is removed)
+- Chart.js (version pinned; for production add an `integrity` hash, see `index.html`)
+- Event bus (the listener belongs to the component and is removed with it)
+
+Run the unit tests with `cargo test -p module-22-js-interop`.
 
 ## Try It
 

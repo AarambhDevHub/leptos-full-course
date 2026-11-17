@@ -41,11 +41,14 @@ set_value.update(|n| *n += 1);
 
 ## Working Examples
 
-- Blog layout
-- Search island
-- Newsletter
-- Theme
-- Waterfall
+- Blog layout (server-only component, no WebAssembly)
+- Search island (a real `#[island]`, the full list is in the server HTML)
+- Newsletter island (server-side address validation, status region)
+- Theme island (head script applies the saved theme before paint, CSS variables)
+
+This module uses the Leptos `islands` feature: `#[island]` components, `HydrationScripts ... islands=true` and `hydrate_islands()`. The feature is marked experimental. To see the difference, build with `cargo leptos build --release` and compare the size of `target/site/pkg/*.wasm` with the same page hydrated as a whole app. The old table of sizes in the page was never measured, so it was removed.
+
+Run the unit tests with `cargo test -p module-24-islands`.
 
 ## Try It
 
