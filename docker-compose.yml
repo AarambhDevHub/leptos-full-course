@@ -1,23 +1,36 @@
+# Module 25 deployment on one machine.
+# Copy .env.example to .env and fill in JWT_SECRET and POSTGRES_PASSWORD first.
+# Compose refuses to start while either one is missing.
 services:
   postgres:
     image: postgres:16
+    restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: leptos_course
-    ports:
-      - "5432:5432"
+    # No "ports:" on purpose. Only the app, on the compose network, can reach
+    # the database. Publishing 5432 would expose it to the whole network.
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d leptos_course"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   app:
     build: .
+    restart: unless-stopped
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     environment:
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/leptos_course
-      JWT_SECRET: change-this-secret-in-production
-      LEPTOS_SITE_ADDR: 0.0.0.0:3000
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/leptos_course
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env (openssl rand -hex 32)}
+      # Secure cookies need https. Behind a TLS proxy leave this as true.
+      # For a quick test over plain http://localhost set COOKIE_SECURE=false.
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
       RUST_LOG: info
     ports:
       - "3000:3000"

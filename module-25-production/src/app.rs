@@ -9,6 +9,12 @@
 //! comments that explain both what each function does and why it
 //! matters in a Leptos application.
 
+// Server function bodies use `return` inside a feature block because the block
+// for the other feature follows it; that shape is clearer for learners.
+#![allow(clippy::needless_return)]
+
+#[cfg(feature = "ssr")]
+use crate::guard;
 use leptos::form::ActionForm;
 use leptos::prelude::*;
 use leptos::server::ServerAction;
@@ -24,9 +30,12 @@ use sqlx::PgPool;
 
 const MODULE_TITLE: &str = "Module 25 - Production";
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "ssr", derive(sqlx::FromRow))]
-pub struct ProdUser {
+/// Database row for a user, including the password hash.
+/// Server only, and deliberately not Serialize or Debug: a type that can be
+/// sent to the browser or printed in a log must never hold the hash.
+#[cfg(feature = "ssr")]
+#[derive(Clone, sqlx::FromRow)]
+struct ProdUser {
     id: Uuid,
     name: String,
     email: String,
@@ -35,6 +44,7 @@ pub struct ProdUser {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ssr", derive(sqlx::FromRow))]
 pub struct ProdUserInfo {
     id: Uuid,
     name: String,
@@ -61,14 +71,46 @@ pub struct ProdNote {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ssr", derive(sqlx::FromRow))]
 pub struct ActivityEvent {
-    id: u32,
+    id: i64,
     message: String,
     severity: String,
     at: String,
 }
 
-pub type AuthContext = RwSignal<Option<ProdUserInfo>>;
+/// Real counts read from the database for the dashboard.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DashboardCounts {
+    notes: i64,
+    events: i64,
+}
+
+/// The signed-in user as the UI knows it.
+///
+/// `me` is the server's answer, loaded during server rendering and handed to
+/// the browser, so a protected page is correct in the very first HTML.
+/// `local` holds what this tab just learned (a login or a logout) and wins
+/// over `me` until the page is reloaded.
+#[derive(Clone, Copy)]
+pub struct Session {
+    me: Resource<Result<Option<ProdUserInfo>, ServerFnError>>,
+    local: RwSignal<Option<Option<ProdUserInfo>>>,
+}
+
+impl Session {
+    pub fn user(&self) -> Option<ProdUserInfo> {
+        match self.local.get() {
+            Some(user) => user,
+            None => self.me.get().and_then(|result| result.ok()).flatten(),
+        }
+    }
+
+    pub fn set(&self, user: Option<ProdUserInfo>) {
+        self.local.set(Some(user));
+    }
+}
+
 pub type ThemeContext = RwSignal<Theme>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,16 +154,11 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 #[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();
-    let auth = RwSignal::new(None::<ProdUserInfo>);
     let theme = RwSignal::new(Theme::Light);
-    provide_context(auth);
     provide_context(theme);
-
-    let me = Resource::new(|| (), |_| prod_me());
-    Effect::new(move |_| {
-        if let Some(Ok(user)) = me.get() {
-            auth.set(user);
-        }
+    provide_context(Session {
+        me: Resource::new(|| (), |_| prod_me()),
+        local: RwSignal::new(None),
     });
 
     view! {
@@ -171,8 +208,72 @@ fn pool() -> Result<PgPool, ServerFnError> {
 /// What it does: loads the JWT signing secret used by the production capstone.
 /// Why it matters: Production auth needs a single secret source that can come from environment configuration.
 #[cfg(feature = "ssr")]
-fn prod_secret() -> String {
-    std::env::var("JWT_SECRET").unwrap_or_else(|_| "module-25-production-secret".into())
+static SECRET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Reads and checks JWT_SECRET once. The server calls this before it listens,
+/// so a missing or weak secret stops the start instead of silently using a
+/// default that everyone could read in the course repository.
+#[cfg(feature = "ssr")]
+pub fn init_secret() -> Result<(), String> {
+    let secret = guard::validate_secret(std::env::var("JWT_SECRET").ok().as_deref())?;
+    let _ = SECRET.set(secret);
+    Ok(())
+}
+
+#[cfg(feature = "ssr")]
+fn prod_secret() -> Result<&'static str, ServerFnError> {
+    SECRET
+        .get()
+        .map(String::as_str)
+        .ok_or_else(|| internal("session", "JWT secret was not initialised"))
+}
+
+/// Whether the session cookie gets the Secure flag (the default).
+/// COOKIE_SECURE=false turns it off for local development over plain http.
+#[cfg(feature = "ssr")]
+fn secure_cookies() -> bool {
+    static SECURE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SECURE.get_or_init(|| guard::cookie_secure(std::env::var("COOKIE_SECURE").ok().as_deref()))
+}
+
+/// Logs the real error on the server and gives the browser a generic one.
+/// Database messages can name tables, columns and values.
+#[cfg(feature = "ssr")]
+fn internal(context: &str, error: impl std::fmt::Display) -> ServerFnError {
+    tracing::error!("{context} failed: {error}");
+    ServerFnError::new("something went wrong on the server, please try again")
+}
+
+/// Failed sign-ins per email, shared by every request in this process.
+#[cfg(feature = "ssr")]
+fn limiter() -> std::sync::MutexGuard<'static, guard::AttemptLimiter> {
+    static LIMITER: std::sync::OnceLock<std::sync::Mutex<guard::AttemptLimiter>> =
+        std::sync::OnceLock::new();
+    LIMITER
+        .get_or_init(|| {
+            std::sync::Mutex::new(guard::AttemptLimiter::new(
+                5,
+                std::time::Duration::from_secs(15 * 60),
+            ))
+        })
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Writes one row to the activity feed. Best effort: a failed log write is
+/// reported on the server and never breaks the action it describes.
+#[cfg(feature = "ssr")]
+async fn log_event(pool: &PgPool, user_id: Option<Uuid>, severity: &str, message: &str) {
+    if let Err(error) =
+        sqlx::query("INSERT INTO activity_events (user_id, message, severity) VALUES ($1, $2, $3)")
+            .bind(user_id)
+            .bind(message)
+            .bind(severity)
+            .execute(pool)
+            .await
+    {
+        tracing::error!("activity log write failed: {error}");
+    }
 }
 
 /// Explains the `hash password` step in this lesson.
@@ -180,16 +281,24 @@ fn prod_secret() -> String {
 /// What it does: turns a plain password into an Argon2 password hash.
 /// Why it matters: Passwords should never be stored directly, even in a course example.
 #[cfg(feature = "ssr")]
-fn hash_password(password: &str) -> Result<String, ServerFnError> {
+async fn hash_password(password: &str) -> Result<String, ServerFnError> {
     use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
     use argon2::Argon2;
 
-    // A fresh random salt for every password, stored inside the resulting hash string.
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map(|hash| hash.to_string())
-        .map_err(ServerFnError::new)
+    let password = password.to_owned();
+    // Argon2 is slow on purpose, so it runs on the blocking pool and never
+    // stalls the async workers that serve other requests.
+    tokio::task::spawn_blocking(move || {
+        // A fresh random salt for every password, stored inside the hash string.
+        let salt = SaltString::generate(&mut OsRng);
+        Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .map(|hash| hash.to_string())
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| internal("hash password", error))?
+    .map_err(|error| internal("hash password", error))
 }
 
 /// Explains the `verify password` step in this lesson.
@@ -197,14 +306,35 @@ fn hash_password(password: &str) -> Result<String, ServerFnError> {
 /// What it does: checks a login password against the stored Argon2 hash.
 /// Why it matters: Authentication is only useful if the server can prove the submitted password matches the hash.
 #[cfg(feature = "ssr")]
-fn verify_password(password: &str, password_hash: &str) -> Result<bool, ServerFnError> {
+async fn verify_password(password: &str, password_hash: &str) -> Result<bool, ServerFnError> {
     use argon2::password_hash::{PasswordHash, PasswordVerifier};
     use argon2::Argon2;
 
-    let parsed_hash = PasswordHash::new(password_hash).map_err(ServerFnError::new)?;
-    Ok(Argon2::default()
-        .verify_password(password.as_bytes(), &parsed_hash)
-        .is_ok())
+    let password = password.to_owned();
+    let password_hash = password_hash.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let parsed_hash = PasswordHash::new(&password_hash).map_err(|error| error.to_string())?;
+        Ok::<bool, String>(
+            Argon2::default()
+                .verify_password(password.as_bytes(), &parsed_hash)
+                .is_ok(),
+        )
+    })
+    .await
+    .map_err(|error| internal("verify password", error))?
+    .map_err(|error| internal("verify password", error))
+}
+
+/// A real hash of a throwaway password. Login verifies against it when the
+/// email is unknown, so an unknown email costs the same time as a wrong
+/// password and the response time does not reveal which emails exist.
+#[cfg(feature = "ssr")]
+async fn dummy_hash() -> Result<&'static str, ServerFnError> {
+    static DUMMY: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+    DUMMY
+        .get_or_try_init(|| async { hash_password("not-a-real-password").await })
+        .await
+        .map(String::as_str)
 }
 
 /// Explains the `sign user` step in this lesson.
@@ -225,9 +355,9 @@ fn sign_user(user: &ProdUser) -> Result<String, ServerFnError> {
     encode(
         &Header::default(),
         &claims,
-        &EncodingKey::from_secret(prod_secret().as_bytes()),
+        &EncodingKey::from_secret(prod_secret()?.as_bytes()),
     )
-    .map_err(ServerFnError::new)
+    .map_err(|error| internal("sign token", error))
 }
 
 /// Explains the `decode user` step in this lesson.
@@ -240,11 +370,11 @@ fn decode_user(token: &str) -> Result<ProdClaims, ServerFnError> {
 
     decode::<ProdClaims>(
         token,
-        &DecodingKey::from_secret(prod_secret().as_bytes()),
+        &DecodingKey::from_secret(prod_secret()?.as_bytes()),
         &Validation::default(),
     )
     .map(|data| data.claims)
-    .map_err(ServerFnError::new)
+    .map_err(|_| ServerFnError::new("login required"))
 }
 
 /// Explains the `write cookie` step in this lesson.
@@ -257,10 +387,10 @@ fn write_cookie(token: &str) -> Result<(), ServerFnError> {
 
     let response = use_context::<leptos_axum::ResponseOptions>()
         .ok_or_else(|| ServerFnError::new("ResponseOptions missing"))?;
-    let cookie = format!("prod_session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=43200");
+    let cookie = guard::session_cookie(token, secure_cookies());
     response.append_header(
         header::SET_COOKIE,
-        HeaderValue::from_str(&cookie).map_err(ServerFnError::new)?,
+        HeaderValue::from_str(&cookie).map_err(|error| internal("write cookie", error))?,
     );
     Ok(())
 }
@@ -277,7 +407,8 @@ fn clear_prod_cookie() -> Result<(), ServerFnError> {
         .ok_or_else(|| ServerFnError::new("ResponseOptions missing"))?;
     response.append_header(
         header::SET_COOKIE,
-        HeaderValue::from_static("prod_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"),
+        HeaderValue::from_str(&guard::cleared_cookie(secure_cookies()))
+            .map_err(|error| internal("clear cookie", error))?,
     );
     Ok(())
 }
@@ -313,7 +444,7 @@ fn prod_cookie() -> Option<String> {
 async fn current_user_id() -> Result<Uuid, ServerFnError> {
     let token = prod_cookie().ok_or_else(|| ServerFnError::new("login required"))?;
     let claims = decode_user(&token)?;
-    Uuid::parse_str(&claims.sub).map_err(ServerFnError::new)
+    Uuid::parse_str(&claims.sub).map_err(|_| ServerFnError::new("login required"))
 }
 
 // ============================================================================
@@ -330,62 +461,88 @@ pub async fn prod_register(
     email: String,
     password: String,
 ) -> Result<(), ServerFnError> {
-    let name = name.trim().to_string();
-    let email = email.trim().to_lowercase();
-    if name.len() < 2 || password.len() < 8 || !email.contains('@') {
-        return Err(ServerFnError::new(
-            "valid name, email, and 8 character password required",
-        ));
-    }
+    let (name, email) =
+        guard::validate_registration(&name, &email, &password).map_err(ServerFnError::new)?;
 
     #[cfg(feature = "ssr")]
     {
+        let pool = pool()?;
+        let id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO production_users (id, name, email, password_hash, role) VALUES ($1, $2, $3, $4, 'user')",
         )
-        .bind(Uuid::new_v4())
+        .bind(id)
         .bind(name)
         .bind(email)
-        .bind(hash_password(&password)?)
-        .execute(&pool()?)
+        .bind(hash_password(&password).await?)
+        .execute(&pool)
         .await
         .map_err(|err| match &err {
             sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
                 ServerFnError::new("that email is already registered")
             }
-            _ => {
-                tracing::error!("register failed: {err}");
-                ServerFnError::new("could not create the account, please try again")
-            }
+            _ => internal("register", err),
         })?;
+        log_event(&pool, Some(id), "info", "Account created").await;
     }
     Ok(())
 }
 
 /// Explains the `prod login` step in this lesson.
 ///
-/// What it does: runs the `prod login` operation on the server and returns typed data to the client.
-/// Why it matters: It demonstrates how Leptos keeps trusted work on the server while preserving a Rust function call shape in the UI.
+/// What it does: checks the password, records the attempt, and sets the session cookie.
+/// Why it matters: Login is the most attacked endpoint of any app. It uses one
+/// error for every failure, spends the same time on an unknown email, and
+/// stops guessing after five failures per email in fifteen minutes.
 #[server]
 pub async fn prod_login(email: String, password: String) -> Result<ProdUserInfo, ServerFnError> {
     let email = email.trim().to_lowercase();
 
     #[cfg(feature = "ssr")]
     {
-        let user = sqlx::query_as::<_, ProdUser>(
-            "SELECT id, name, email, password_hash, role FROM production_users WHERE email = $1",
-        )
-        .bind(email)
-        .fetch_optional(&pool()?)
-        .await
-        .map_err(ServerFnError::new)?
-        .ok_or_else(|| ServerFnError::new("invalid credentials"))?;
-
-        if !verify_password(&password, &user.password_hash)? {
-            return Err(ServerFnError::new("invalid credentials"));
+        const FAILED: &str = "invalid credentials";
+        let now = std::time::Instant::now();
+        if !limiter().allowed(&email, now) {
+            return Err(ServerFnError::new(
+                "too many failed attempts, try again in a few minutes",
+            ));
+        }
+        // Oversized input is refused before it reaches the slow hash.
+        if email.chars().count() > guard::EMAIL_MAX
+            || password.chars().count() > guard::PASSWORD_MAX
+        {
+            limiter().record_failure(&email, now);
+            return Err(ServerFnError::new(FAILED));
         }
 
+        let pool = pool()?;
+        let found = sqlx::query_as::<_, ProdUser>(
+            "SELECT id, name, email, password_hash, role FROM production_users WHERE email = $1",
+        )
+        .bind(&email)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|error| internal("login lookup", error))?;
+
+        let hash = match &found {
+            Some(user) => user.password_hash.as_str(),
+            None => dummy_hash().await?,
+        };
+        let password_ok = verify_password(&password, hash).await?;
+        let user = match found {
+            Some(user) if password_ok => user,
+            other => {
+                limiter().record_failure(&email, std::time::Instant::now());
+                if let Some(user) = other {
+                    log_event(&pool, Some(user.id), "warn", "Failed sign-in attempt").await;
+                }
+                return Err(ServerFnError::new(FAILED));
+            }
+        };
+
+        limiter().record_success(&email);
         write_cookie(&sign_user(&user)?)?;
+        log_event(&pool, Some(user.id), "info", "Signed in").await;
         return Ok(ProdUserInfo {
             id: user.id,
             name: user.name,
@@ -412,7 +569,12 @@ pub async fn prod_login(email: String, password: String) -> Result<ProdUserInfo,
 #[server]
 pub async fn prod_logout() -> Result<(), ServerFnError> {
     #[cfg(feature = "ssr")]
-    clear_prod_cookie()?;
+    {
+        if let (Ok(user_id), Ok(pool)) = (current_user_id().await, pool()) {
+            log_event(&pool, Some(user_id), "info", "Signed out").await;
+        }
+        clear_prod_cookie()?;
+    }
     Ok(())
 }
 
@@ -424,27 +586,17 @@ pub async fn prod_logout() -> Result<(), ServerFnError> {
 pub async fn prod_me() -> Result<Option<ProdUserInfo>, ServerFnError> {
     #[cfg(feature = "ssr")]
     {
-        let Some(token) = prod_cookie() else {
+        // No cookie, a bad signature, or an expired token all mean "nobody".
+        let Ok(id) = current_user_id().await else {
             return Ok(None);
         };
-        let claims = match decode_user(&token) {
-            Ok(claims) => claims,
-            Err(_) => return Ok(None),
-        };
-        let id = Uuid::parse_str(&claims.sub).map_err(ServerFnError::new)?;
-        let user = sqlx::query_as::<_, ProdUser>(
-            "SELECT id, name, email, password_hash, role FROM production_users WHERE id = $1",
+        return sqlx::query_as::<_, ProdUserInfo>(
+            "SELECT id, name, email, role FROM production_users WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&pool()?)
         .await
-        .map_err(ServerFnError::new)?;
-        return Ok(user.map(|user| ProdUserInfo {
-            id: user.id,
-            name: user.name,
-            email: user.email,
-            role: user.role,
-        }));
+        .map_err(|error| internal("load session user", error));
     }
 
     #[cfg(not(feature = "ssr"))]
@@ -463,12 +615,12 @@ pub async fn prod_notes() -> Result<Vec<ProdNote>, ServerFnError> {
     {
         let user_id = current_user_id().await?;
         return sqlx::query_as::<_, ProdNote>(
-            "SELECT id, user_id, title, body, updated_at FROM production_notes WHERE user_id = $1 ORDER BY updated_at DESC",
+            "SELECT id, user_id, title, body, updated_at FROM production_notes WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 200",
         )
         .bind(user_id)
         .fetch_all(&pool()?)
         .await
-        .map_err(ServerFnError::new);
+        .map_err(|error| internal("list notes", error));
     }
 
     #[cfg(not(feature = "ssr"))]
@@ -483,23 +635,24 @@ pub async fn prod_notes() -> Result<Vec<ProdNote>, ServerFnError> {
 /// Why it matters: It demonstrates how Leptos keeps trusted work on the server while preserving a Rust function call shape in the UI.
 #[server]
 pub async fn prod_create_note(title: String, body: String) -> Result<ProdNote, ServerFnError> {
-    if title.trim().is_empty() {
-        return Err(ServerFnError::new("title is required"));
-    }
+    let (title, body) = guard::validate_note(&title, &body).map_err(ServerFnError::new)?;
 
     #[cfg(feature = "ssr")]
     {
         let user_id = current_user_id().await?;
-        return sqlx::query_as::<_, ProdNote>(
+        let pool = pool()?;
+        let note = sqlx::query_as::<_, ProdNote>(
             "INSERT INTO production_notes (id, user_id, title, body) VALUES ($1, $2, $3, $4) RETURNING id, user_id, title, body, updated_at",
         )
         .bind(Uuid::new_v4())
         .bind(user_id)
         .bind(title)
         .bind(body)
-        .fetch_one(&pool()?)
+        .fetch_one(&pool)
         .await
-        .map_err(ServerFnError::new);
+        .map_err(|error| internal("create note", error))?;
+        log_event(&pool, Some(user_id), "info", "Note created").await;
+        return Ok(note);
     }
 
     #[cfg(not(feature = "ssr"))]
@@ -522,14 +675,21 @@ pub async fn prod_create_note(title: String, body: String) -> Result<ProdNote, S
 pub async fn prod_delete_note(id: String) -> Result<(), ServerFnError> {
     #[cfg(feature = "ssr")]
     {
-        let note_id = Uuid::parse_str(&id).map_err(ServerFnError::new)?;
+        let note_id = Uuid::parse_str(&id).map_err(|_| ServerFnError::new("invalid note id"))?;
         let user_id = current_user_id().await?;
-        sqlx::query("DELETE FROM production_notes WHERE id = $1 AND user_id = $2")
+        let pool = pool()?;
+        let result = sqlx::query("DELETE FROM production_notes WHERE id = $1 AND user_id = $2")
             .bind(note_id)
             .bind(user_id)
-            .execute(&pool()?)
+            .execute(&pool)
             .await
-            .map_err(ServerFnError::new)?;
+            .map_err(|error| internal("delete note", error))?;
+        // Zero rows means the note does not exist or belongs to someone else.
+        // Both look the same to the caller, and neither is reported as success.
+        if result.rows_affected() == 0 {
+            return Err(ServerFnError::new("note not found"));
+        }
+        log_event(&pool, Some(user_id), "info", "Note deleted").await;
     }
     Ok(())
 }
@@ -540,26 +700,52 @@ pub async fn prod_delete_note(id: String) -> Result<(), ServerFnError> {
 /// Why it matters: It demonstrates how Leptos keeps trusted work on the server while preserving a Rust function call shape in the UI.
 #[server]
 pub async fn prod_activity() -> Result<Vec<ActivityEvent>, ServerFnError> {
-    Ok(vec![
-        ActivityEvent {
-            id: 1,
-            message: "Health check passed".into(),
-            severity: "ok".into(),
-            at: chrono::Utc::now().format("%H:%M:%S").to_string(),
-        },
-        ActivityEvent {
-            id: 2,
-            message: "Notes cache refreshed".into(),
-            severity: "info".into(),
-            at: chrono::Utc::now().format("%H:%M:%S").to_string(),
-        },
-        ActivityEvent {
-            id: 3,
-            message: "Realtime channel idle".into(),
-            severity: "info".into(),
-            at: chrono::Utc::now().format("%H:%M:%S").to_string(),
-        },
-    ])
+    #[cfg(feature = "ssr")]
+    {
+        let user_id = current_user_id().await?;
+        return sqlx::query_as::<_, ActivityEvent>(
+            "SELECT id, message, severity, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS \"UTC\"') AS at \
+             FROM activity_events WHERE user_id = $1 ORDER BY created_at DESC, id DESC LIMIT 50",
+        )
+        .bind(user_id)
+        .fetch_all(&pool()?)
+        .await
+        .map_err(|error| internal("list activity", error));
+    }
+
+    #[cfg(not(feature = "ssr"))]
+    {
+        Ok(Vec::new())
+    }
+}
+
+/// Explains the `prod stats` step in this lesson.
+///
+/// What it does: counts this user's notes and activity rows in the database.
+/// Why it matters: A dashboard number must be measured, never typed in.
+#[server]
+pub async fn prod_stats() -> Result<DashboardCounts, ServerFnError> {
+    #[cfg(feature = "ssr")]
+    {
+        let user_id = current_user_id().await?;
+        let (notes, events) = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT (SELECT COUNT(*) FROM production_notes WHERE user_id = $1), \
+                    (SELECT COUNT(*) FROM activity_events WHERE user_id = $1)",
+        )
+        .bind(user_id)
+        .fetch_one(&pool()?)
+        .await
+        .map_err(|error| internal("load stats", error))?;
+        return Ok(DashboardCounts { notes, events });
+    }
+
+    #[cfg(not(feature = "ssr"))]
+    {
+        Ok(DashboardCounts {
+            notes: 0,
+            events: 0,
+        })
+    }
 }
 
 /// Explains the `app nav` step in this lesson.
@@ -568,7 +754,7 @@ pub async fn prod_activity() -> Result<Vec<ActivityEvent>, ServerFnError> {
 /// Why it matters: Keeping this UI section isolated makes the signal, context, action, or routing pattern easier to study.
 #[component]
 fn AppNav() -> impl IntoView {
-    let auth = expect_context::<AuthContext>();
+    let session = expect_context::<Session>();
     let theme = expect_context::<ThemeContext>();
 
     view! {
@@ -586,10 +772,13 @@ fn AppNav() -> impl IntoView {
                 <button on:click=move |_| {
                     theme.update(|value| *value = if *value == Theme::Light { Theme::Dark } else { Theme::Light });
                 }>{move || if theme.get() == Theme::Light { "Dark" } else { "Light" }}</button>
-                {move || match auth.get() {
-                    Some(user) => view! { <span>{user.email}</span> <LogoutButton/> }.into_any(),
-                    None => view! { <A href="/login">"Login"</A> <A href="/register">"Register"</A> }.into_any(),
-                }}
+                // The session is a resource, so it is read inside Suspense.
+                <Suspense fallback=|| ()>
+                    {move || match session.user() {
+                        Some(user) => view! { <span>{user.email}</span> <LogoutButton/> }.into_any(),
+                        None => view! { <A href="/login">"Login"</A> <A href="/register">"Register"</A> }.into_any(),
+                    }}
+                </Suspense>
             </div>
         </nav>
     }
@@ -617,7 +806,7 @@ fn HomePage() -> impl IntoView {
 /// Why it matters: Keeping this UI section isolated makes the signal, context, action, or routing pattern easier to study.
 #[component]
 fn LoginPage() -> impl IntoView {
-    let auth = expect_context::<AuthContext>();
+    let session = expect_context::<Session>();
     let navigate = use_navigate();
     let action = ServerAction::<ProdLogin>::new();
     let pending = action.pending();
@@ -625,7 +814,7 @@ fn LoginPage() -> impl IntoView {
 
     Effect::new(move |_| {
         if let Some(Ok(user)) = value.get() {
-            auth.set(Some(user));
+            session.set(Some(user));
             navigate("/dashboard", Default::default());
         }
     });
@@ -636,12 +825,14 @@ fn LoginPage() -> impl IntoView {
             <h1>"Login"</h1>
             <div style="display: grid; gap: 10px;">
                 <ActionForm action=action>
-                    <input name="email" type="email" placeholder="Email"/>
-                    <input name="password" type="password" placeholder="Password"/>
+                    <label for="login-email">"Email"</label>
+                    <input id="login-email" name="email" type="email" autocomplete="username" required maxlength="254"/>
+                    <label for="login-password">"Password"</label>
+                    <input id="login-password" name="password" type="password" autocomplete="current-password" required maxlength="128"/>
                     <button type="submit" disabled=move || pending.get()>{move || if pending.get() { "Signing in..." } else { "Login" }}</button>
                 </ActionForm>
             </div>
-            {move || value.get().and_then(|result| result.err()).map(|error| view! { <p style="color: #b91c1c;">{error.to_string()}</p> })}
+            <p role="alert" style="color: #b91c1c;">{move || value.get().and_then(|result| result.err()).map(|error| error.to_string())}</p>
         </section>
     }
 }
@@ -662,16 +853,19 @@ fn RegisterPage() -> impl IntoView {
             <h1>"Register"</h1>
             <div style="display: grid; gap: 10px;">
                 <ActionForm action=action>
-                    <input name="name" placeholder="Name"/>
-                    <input name="email" type="email" placeholder="Email"/>
-                    <input name="password" type="password" placeholder="Password"/>
+                    <label for="reg-name">"Name"</label>
+                    <input id="reg-name" name="name" autocomplete="name" required minlength="2" maxlength="80"/>
+                    <label for="reg-email">"Email"</label>
+                    <input id="reg-email" name="email" type="email" autocomplete="email" required maxlength="254"/>
+                    <label for="reg-password">"Password (8 to 128 characters)"</label>
+                    <input id="reg-password" name="password" type="password" autocomplete="new-password" required minlength="8" maxlength="128"/>
                     <button type="submit" disabled=move || pending.get()>{move || if pending.get() { "Creating..." } else { "Register" }}</button>
                 </ActionForm>
             </div>
-            {move || value.get().map(|result| match result {
-                Ok(()) => view! { <p style="color: #166534;">"Account created. Login next."</p> }.into_any(),
-                Err(error) => view! { <p style="color: #b91c1c;">{error.to_string()}</p> }.into_any(),
-            })}
+            <p role="status">{move || value.get().map(|result| match result {
+                Ok(()) => view! { <span style="color: #166534;">"Account created. Login next."</span> }.into_any(),
+                Err(error) => view! { <span style="color: #b91c1c;">{error.to_string()}</span> }.into_any(),
+            })}</p>
         </section>
     }
 }
@@ -682,16 +876,18 @@ fn RegisterPage() -> impl IntoView {
 /// Why it matters: Keeping this UI section isolated makes the signal, context, action, or routing pattern easier to study.
 #[component]
 fn LogoutButton() -> impl IntoView {
-    let auth = expect_context::<AuthContext>();
+    let session = expect_context::<Session>();
     let navigate = use_navigate();
 
     view! {
         <button on:click=move |_| {
             let navigate = navigate.clone();
             leptos::task::spawn_local(async move {
-                let _ = prod_logout().await;
-                auth.set(None);
-                navigate("/", Default::default());
+                // Only say "logged out" when the server confirmed it cleared the cookie.
+                if prod_logout().await.is_ok() {
+                    session.set(None);
+                    navigate("/", Default::default());
+                }
             });
         }>"Logout"</button>
     }
@@ -703,20 +899,22 @@ fn LogoutButton() -> impl IntoView {
 /// Why it matters: Keeping this UI section isolated makes the signal, context, action, or routing pattern easier to study.
 #[component]
 fn Protected(children: ChildrenFn) -> impl IntoView {
-    let auth = expect_context::<AuthContext>();
+    let session = expect_context::<Session>();
 
     view! {
-        {move || if auth.get().is_some() {
-            children().into_any()
-        } else {
-            view! {
-                <section style="border: 1px solid #fde68a; border-radius: 8px; padding: 20px; background: #fffbeb; color: #111827;">
-                    <h1>"Login required"</h1>
-                    <p>"This route is protected by AuthContext."</p>
-                    <A href="/login">"Go to login"</A>
-                </section>
-            }.into_any()
-        }}
+        <Suspense fallback=|| view! { <p role="status">"Checking your session..."</p> }>
+            {move || if session.user().is_some() {
+                children().into_any()
+            } else {
+                view! {
+                    <section style="border: 1px solid #fde68a; border-radius: 8px; padding: 20px; background: #fffbeb; color: #111827;">
+                        <h1>"Login required"</h1>
+                        <p>"Sign in to see this page."</p>
+                        <A href="/login">"Go to login"</A>
+                    </section>
+                }.into_any()
+            }}
+        </Suspense>
     }
 }
 
@@ -726,17 +924,25 @@ fn Protected(children: ChildrenFn) -> impl IntoView {
 /// Why it matters: Keeping this UI section isolated makes the signal, context, action, or routing pattern easier to study.
 #[component]
 fn DashboardPage() -> impl IntoView {
+    let stats = Resource::new(|| (), |_| prod_stats());
+
     view! {
         <Protected>
             <Title text="Dashboard"/>
             <section style="display: grid; gap: 16px;">
                 <h1>"Dashboard"</h1>
-                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px;">
-                    <Metric label="Health" value="ok"/>
-                    <Metric label="Readiness" value="/ready"/>
-                    <Metric label="Tracing" value="json"/>
-                    <Metric label="Compression" value="gzip"/>
-                </div>
+                <Suspense fallback=|| view! { <p role="status">"Loading numbers..."</p> }>
+                    {move || stats.get().map(|result| match result {
+                        Ok(stats) => view! {
+                            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px;">
+                                <Metric label="Your notes" value=stats.notes.to_string()/>
+                                <Metric label="Your activity events" value=stats.events.to_string()/>
+                            </div>
+                        }.into_any(),
+                        Err(error) => view! { <p style="color: #b91c1c;">{error.to_string()}</p> }.into_any(),
+                    })}
+                </Suspense>
+                <p>"Server health is served at /health and database readiness at /ready. A deployment platform checks those, not this page."</p>
             </section>
         </Protected>
     }
@@ -744,10 +950,10 @@ fn DashboardPage() -> impl IntoView {
 
 /// Explains the `metric` step in this lesson.
 ///
-/// What it does: renders the `Metric` component for one focused part of the lesson UI.
-/// Why it matters: Keeping this UI section isolated makes the signal, context, action, or routing pattern easier to study.
+/// What it does: renders one labelled number.
+/// Why it matters: The value is a String that the caller measured, not a constant typed into the view.
 #[component]
-fn Metric(label: &'static str, value: &'static str) -> impl IntoView {
+fn Metric(label: &'static str, value: String) -> impl IntoView {
     view! {
         <article style="background: #f6f7fb; color: #111827; border-radius: 8px; padding: 16px;">
             <span>{label}</span>
@@ -765,6 +971,7 @@ fn NotesPage() -> impl IntoView {
     let notes = Resource::new(|| (), |_| prod_notes());
     let create = ServerAction::<ProdCreateNote>::new();
     let pending = create.pending();
+    let delete_error = RwSignal::new(None::<String>);
 
     Effect::new(move |_| {
         if let Some(Ok(_)) = create.value().get() {
@@ -779,11 +986,17 @@ fn NotesPage() -> impl IntoView {
                 <h1>"Notes"</h1>
                 <div style="display: grid; gap: 8px;">
                     <ActionForm action=create>
-                        <input name="title" placeholder="Title"/>
-                        <textarea name="body" placeholder="Body"></textarea>
+                        <label for="note-title">"Title"</label>
+                        <input id="note-title" name="title" required maxlength="200"/>
+                        <label for="note-body">"Body"</label>
+                        <textarea id="note-body" name="body" maxlength="10000"></textarea>
                         <button type="submit" disabled=move || pending.get()>{move || if pending.get() { "Saving..." } else { "Create note" }}</button>
                     </ActionForm>
                 </div>
+                <p role="alert" style="color: #b91c1c;">
+                    {move || create.value().get().and_then(|result| result.err()).map(|error| error.to_string())}
+                    {move || delete_error.get()}
+                </p>
                 <Suspense fallback=|| view! { <p>"Loading notes..."</p> }>
                     {move || notes.get().map(|result| match result {
                         Ok(items) => view! {
@@ -798,7 +1011,8 @@ fn NotesPage() -> impl IntoView {
                                             <small>{note.updated_at.format("%Y-%m-%d %H:%M UTC").to_string()}</small>
                                             <button on:click=move |_| {
                                                 leptos::task::spawn_local(async move {
-                                                    let _ = prod_delete_note(note.id.to_string()).await;
+                                                    // Show a failed delete instead of pretending it worked.
+                                                    delete_error.set(prod_delete_note(note.id.to_string()).await.err().map(|error| error.to_string()));
                                                     notes.refetch();
                                                 });
                                             }>"Delete"</button>
@@ -821,12 +1035,12 @@ fn NotesPage() -> impl IntoView {
 /// Why it matters: Keeping this UI section isolated makes the signal, context, action, or routing pattern easier to study.
 #[component]
 fn ProfilePage() -> impl IntoView {
-    let auth = expect_context::<AuthContext>();
+    let session = expect_context::<Session>();
 
     view! {
         <Protected>
             <Title text="Profile"/>
-            {move || auth.get().map(|user| view! {
+            {move || session.user().map(|user| view! {
                 <section style="border: 1px solid #d9dee8; border-radius: 8px; padding: 20px;">
                     <h1>"Profile"</h1>
                     <p>"Name: " {user.name}</p>
@@ -881,6 +1095,7 @@ fn ActivityPage() -> impl IntoView {
                 <h1>"Activity feed"</h1>
                 <Suspense fallback=|| view! { <p>"Loading activity..."</p> }>
                     {move || events.get().map(|result| match result {
+                        Ok(events) if events.is_empty() => view! { <p>"No activity yet."</p> }.into_any(),
                         Ok(events) => view! {
                             <ul>
                                 {events.into_iter().map(|event| view! {

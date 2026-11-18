@@ -20,7 +20,7 @@
 #[cfg(feature = "ssr")]
 #[tokio::main]
 async fn main() {
-    use axum::{http::StatusCode, routing::get, Router};
+    use axum::{extract::DefaultBodyLimit, http::StatusCode, middleware, routing::get, Router};
     use leptos::logging::log;
     use leptos::prelude::*;
     use leptos_axum::{generate_route_list, LeptosRoutes};
@@ -31,8 +31,17 @@ async fn main() {
     let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()
         .json()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
+
+    // No default secret: refuse to start without a real one.
+    if let Err(message) = init_secret() {
+        eprintln!("refusing to start: {message}");
+        std::process::exit(1);
+    }
 
     let conf = get_configuration(None).unwrap();
     let addr = conf.leptos_options.site_addr;
@@ -75,6 +84,11 @@ async fn main() {
             },
         )
         .fallback(leptos_axum::file_and_error_handler(shell))
+        // These layers wrap every route added above, so they are added last.
+        .layer(DefaultBodyLimit::max(
+            module_25_production::guard::BODY_LIMIT_BYTES,
+        ))
+        .layer(middleware::map_response(security_headers))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(30),
@@ -91,6 +105,30 @@ async fn main() {
         .unwrap();
 }
 
+/// Adds browser hardening headers to every response.
+/// A Content-Security-Policy is not set here: Leptos injects an inline
+/// hydration script, so a strict policy needs a per-request nonce first.
+#[cfg(feature = "ssr")]
+async fn security_headers(mut response: axum::response::Response) -> axum::response::Response {
+    use axum::http::{HeaderName, HeaderValue};
+    let headers = response.headers_mut();
+    for (name, value) in [
+        ("x-content-type-options", "nosniff"),
+        ("x-frame-options", "DENY"),
+        ("referrer-policy", "strict-origin-when-cross-origin"),
+        (
+            "permissions-policy",
+            "camera=(), microphone=(), geolocation=()",
+        ),
+    ] {
+        headers.insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_static(value),
+        );
+    }
+    response
+}
+
 /// Explains the `connect with retry` step in this lesson.
 ///
 /// What it does: connects to PostgreSQL with startup retry behavior.
@@ -99,12 +137,20 @@ async fn main() {
 async fn connect_with_retry(database_url: &str, attempts: u32) -> sqlx::PgPool {
     let mut last_error = None;
     for attempt in 1..=attempts {
-        match sqlx::PgPool::connect(database_url).await {
+        let connect = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(10)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect(database_url)
+            .await;
+        match connect {
             Ok(pool) => return pool,
             Err(error) => {
                 tracing::warn!(attempt, error = %error, "database connection failed");
                 last_error = Some(error);
-                tokio::time::sleep(std::time::Duration::from_secs(attempt as u64)).await;
+                // Wait only when another attempt follows.
+                if attempt < attempts {
+                    tokio::time::sleep(std::time::Duration::from_secs(attempt as u64)).await;
+                }
             }
         }
     }

@@ -6,6 +6,7 @@
 //! comments that explain both what each function does and why it
 //! matters in a Leptos application.
 pub mod app;
+pub mod guard;
 
 // ============================================================================
 // LESSON 1: Hydration Entry Point
